@@ -1,0 +1,21 @@
+services:
+  # Unified Full-Stack Service (React + NestJS + yt-dlp + ffmpeg)
+  - type: web
+    name: youdown
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DOWNLOAD_FORMAT
+        value: mp4
+      - key: DOWNLOAD_QUALITY
+        value: best
+      - key: CACHE_RETENTION_MINUTES
+        value: 30
+      - key: MAX_VIDEO_DURATION_SECONDS
+        value: 10800
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: 5

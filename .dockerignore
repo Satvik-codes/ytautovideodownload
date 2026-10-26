@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+**/downloads
+**/*.mp4
+**/*.webm
+**/*.m4a
+**/*.mp3
+.git
+.github
+.env
+.gemini
