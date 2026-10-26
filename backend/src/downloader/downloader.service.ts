@@ -75,7 +75,11 @@ export class DownloaderService {
     } else if (cookiesEnv && cookiesEnv.trim()) {
       const tempCookiePath = path.join(this.storageDir, 'yt_cookies.txt');
       try {
-        fs.writeFileSync(tempCookiePath, cookiesEnv.trim(), 'utf-8');
+        let content = cookiesEnv.trim();
+        if (content.startsWith('base64:')) {
+          content = Buffer.from(content.replace('base64:', ''), 'base64').toString('utf-8');
+        }
+        fs.writeFileSync(tempCookiePath, content, 'utf-8');
         baseArgs.push('--cookies', tempCookiePath);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
