@@ -5,7 +5,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { extractAndValidateVideo } from './utils/youtube-validator.js';
@@ -55,13 +55,43 @@ export class DownloaderService {
     };
   }
 
+  private getBaseYtDlpArgs(): string[] {
+    const baseArgs = [
+      '--no-config',
+      '--no-playlist',
+      // Multi-client strategy to bypass datacenter IP bot detection (Android/iOS APIs don't block cloud IPs)
+      '--extractor-args',
+      'youtube:player_client=android,web,mweb,ios',
+      '--user-agent',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    ];
+
+    // Support optional YouTube cookies (via YOUTUBE_COOKIES or COOKIES_FILE env var)
+    const cookiesEnv = this.configService.get<string>('YOUTUBE_COOKIES');
+    const cookiesFile = this.configService.get<string>('COOKIES_FILE');
+
+    if (cookiesFile && fs.existsSync(cookiesFile)) {
+      baseArgs.push('--cookies', cookiesFile);
+    } else if (cookiesEnv && cookiesEnv.trim()) {
+      const tempCookiePath = path.join(this.storageDir, 'yt_cookies.txt');
+      try {
+        fs.writeFileSync(tempCookiePath, cookiesEnv.trim());
+        baseArgs.push('--cookies', tempCookiePath);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.warn(`Could not write cookies: ${msg}`);
+      }
+    }
+
+    return baseArgs;
+  }
+
   async getVideoInfo(input: string): Promise<VideoInfoResponse> {
     const { videoId, normalizedUrl } = extractAndValidateVideo(input);
 
     return new Promise<VideoInfoResponse>((resolve, reject) => {
       const args = [
-        '--no-config',
-        '--no-playlist',
+        ...this.getBaseYtDlpArgs(),
         '--dump-json',
         '--',
         normalizedUrl,
@@ -90,10 +120,19 @@ export class DownloaderService {
 
       child.on('close', (code) => {
         if (code !== 0) {
+          const firstErrLine =
+            stderrData
+              .split('\n')
+              .find((line) => line.includes('ERROR:'))
+              ?.replace(/^.*ERROR:\s*/, '')
+              ?.trim() ||
+            stderrData.trim() ||
+            `Exit code ${code}`;
+
           this.logger.error(`yt-dlp exited with code ${code}: ${stderrData}`);
           return reject(
             new BadRequestException(
-              'Could not retrieve video information. The video may be private, age-restricted, or removed.',
+              `Could not retrieve video information: ${firstErrLine}`,
             ),
           );
         }
@@ -163,7 +202,6 @@ export class DownloaderService {
       const stats = fs.statSync(finalFilePath);
       if (stats.size > 0) {
         this.logger.log(`Serving cached video for ID ${videoId} (${stats.size} bytes)`);
-        // Fast title retrieval
         const cachedTitle = await this.quickGetTitle(videoId, normalizedUrl);
         return {
           filePath: finalFilePath,
@@ -200,11 +238,20 @@ export class DownloaderService {
 
       child.on('close', async (code) => {
         if (code !== 0) {
+          const firstErrLine =
+            stderrData
+              .split('\n')
+              .find((line) => line.includes('ERROR:'))
+              ?.replace(/^.*ERROR:\s*/, '')
+              ?.trim() ||
+            stderrData.trim() ||
+            `Exit code ${code}`;
+
           this.logger.error(`Download process exited with code ${code}: ${stderrData}`);
           this.cleanupPartialFiles(videoId);
           return reject(
             new BadRequestException(
-              'Download failed. Video might be unavailable or restricted.',
+              `Download failed: ${firstErrLine}`,
             ),
           );
         }
@@ -234,13 +281,13 @@ export class DownloaderService {
     normalizedUrl: string,
     videoId: string,
   ): { args: string[]; expectedExt: string } {
+    const baseArgs = this.getBaseYtDlpArgs();
     const outputTemplate = path.join(this.storageDir, `${videoId}.%(ext)s`);
 
     if (this.defaultFormat === 'mp3') {
       return {
         args: [
-          '--no-config',
-          '--no-playlist',
+          ...baseArgs,
           '-x',
           '--audio-format',
           'mp3',
@@ -258,8 +305,7 @@ export class DownloaderService {
     if (this.defaultFormat === 'm4a') {
       return {
         args: [
-          '--no-config',
-          '--no-playlist',
+          ...baseArgs,
           '-x',
           '--audio-format',
           'm4a',
@@ -288,8 +334,7 @@ export class DownloaderService {
 
     return {
       args: [
-        '--no-config',
-        '--no-playlist',
+        ...baseArgs,
         '-f',
         formatSelector,
         '--merge-output-format',
@@ -308,7 +353,7 @@ export class DownloaderService {
       return await new Promise<string>((resolve) => {
         const child = spawn(
           'yt-dlp',
-          ['--no-config', '--get-title', '--', normalizedUrl],
+          [...this.getBaseYtDlpArgs(), '--get-title', '--', normalizedUrl],
           { shell: false },
         );
         let out = '';
