@@ -59,9 +59,9 @@ export class DownloaderService {
     const baseArgs = [
       '--no-config',
       '--no-playlist',
-      // Multi-client strategy to bypass datacenter IP bot detection (Android/iOS APIs don't block cloud IPs)
+      // Use TV, iOS, and Mobile Web clients (bypasses desktop WEB client bot challenge on datacenter IPs)
       '--extractor-args',
-      'youtube:player_client=android,web,mweb,ios',
+      'youtube:player_client=tv,ios,mweb',
       '--user-agent',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     ];
@@ -75,12 +75,21 @@ export class DownloaderService {
     } else if (cookiesEnv && cookiesEnv.trim()) {
       const tempCookiePath = path.join(this.storageDir, 'yt_cookies.txt');
       try {
-        fs.writeFileSync(tempCookiePath, cookiesEnv.trim());
+        fs.writeFileSync(tempCookiePath, cookiesEnv.trim(), 'utf-8');
         baseArgs.push('--cookies', tempCookiePath);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.logger.warn(`Could not write cookies: ${msg}`);
       }
+    }
+
+    // Support optional proxy if datacenter IP is completely blocked by YouTube
+    const proxy =
+      this.configService.get<string>('YOUTUBE_PROXY') ||
+      this.configService.get<string>('HTTP_PROXY') ||
+      this.configService.get<string>('HTTPS_PROXY');
+    if (proxy && proxy.trim()) {
+      baseArgs.push('--proxy', proxy.trim());
     }
 
     return baseArgs;
