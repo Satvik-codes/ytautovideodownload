@@ -22,3 +22,5 @@ services:
         value: 2
       - key: WARP_ENABLED
         value: true
+      - key: STREAM_TOKEN_SECRET
+        generateValue: true

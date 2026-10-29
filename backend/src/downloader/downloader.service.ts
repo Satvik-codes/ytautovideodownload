@@ -9,8 +9,14 @@ import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { extractAndValidateVideo } from './utils/youtube-validator.js';
-import { VideoInfoResponse, BackendSettingsResponse } from './dto/video-info.dto.js';
+import {
+  VideoInfoResponse,
+  BackendSettingsResponse,
+  StreamDescriptor,
+  VideoStreams,
+} from './dto/video-info.dto.js';
 import { WarpService } from './warp.service.js';
+import { StreamTokenPayload, StreamTokenSigner } from './utils/stream-token.js';
 
 export interface DownloadResult {
   filePath: string;
@@ -25,9 +31,12 @@ interface YtDlpResult {
   stderr: string;
 }
 
-// The embedded-player client is checked less strictly than the desktop web
-// client on datacenter IPs; mweb/tv are fallbacks for non-embeddable videos.
-const DEFAULT_EXTRACTOR_ARGS = 'youtube:player_client=web_embedded,mweb,tv';
+export const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+
+// Tried in order. The embedded-player client is checked less strictly on
+// datacenter IPs and needs one request; mweb/tv cover non-embeddable videos.
+const DEFAULT_CLIENT_CHAIN = ['web_embedded', 'mweb,tv'];
 
 // stderr patterns that mean YouTube is blocking our egress IP
 const BLOCKED_PATTERNS = [
@@ -51,6 +60,7 @@ export class DownloaderService {
   private readonly maxDurationSeconds: number;
   private readonly infoCacheTtlMs: number;
   private readonly infoCache = new Map<string, { info: VideoInfoResponse; expiresAt: number }>();
+  private readonly tokenSigner: StreamTokenSigner;
 
   constructor(
     private readonly configService: ConfigService,
@@ -68,6 +78,7 @@ export class DownloaderService {
     );
     this.infoCacheTtlMs =
       parseInt(this.configService.get<string>('INFO_CACHE_MINUTES') || '300', 10) * 60 * 1000;
+    this.tokenSigner = new StreamTokenSigner(this.configService.get<string>('STREAM_TOKEN_SECRET'));
 
     const configuredStorage =
       this.configService.get<string>('DOWNLOAD_STORAGE_DIR') || './downloads';
@@ -86,26 +97,45 @@ export class DownloaderService {
     };
   }
 
-  private getBaseYtDlpArgs(): string[] {
+  /** Proxy for all YouTube traffic: an explicit proxy wins, else the WARP tunnel when up. */
+  getProxyUrl(): string | null {
+    const proxy =
+      this.configService.get<string>('YOUTUBE_PROXY') ||
+      this.configService.get<string>('HTTP_PROXY') ||
+      this.configService.get<string>('HTTPS_PROXY') ||
+      this.warpService.getProxyUrl();
+    return proxy && proxy.trim() ? proxy.trim() : null;
+  }
+
+  verifyStreamToken(token: string): StreamTokenPayload | null {
+    return this.tokenSigner.verify(token);
+  }
+
+  /** Drops cached info so the next request re-extracts (e.g. after the egress IP changed). */
+  invalidateInfo(videoId: string) {
+    this.infoCache.delete(videoId);
+  }
+
+  /** Extractor-args values to try in order; env overrides disable the fallback chain. */
+  private extractorArgsChain(): string[] {
+    const extractorArgs = this.configService.get<string>('YOUTUBE_EXTRACTOR_ARGS');
+    const playerClient = this.configService.get<string>('YOUTUBE_PLAYER_CLIENT');
+    if (extractorArgs && extractorArgs.trim()) return [extractorArgs.trim()];
+    if (playerClient && playerClient.trim()) return [`youtube:player_client=${playerClient.trim()}`];
+    return DEFAULT_CLIENT_CHAIN.map((clients) => `youtube:player_client=${clients}`);
+  }
+
+  private getBaseYtDlpArgs(extractorArgs: string): string[] {
     const baseArgs = [
       '--no-config',
       '--no-playlist',
       '--js-runtimes',
       'node',
       '--user-agent',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      USER_AGENT,
+      '--extractor-args',
+      extractorArgs,
     ];
-
-    // Support optional extractor args or player client overrides
-    const extractorArgs = this.configService.get<string>('YOUTUBE_EXTRACTOR_ARGS');
-    const playerClient = this.configService.get<string>('YOUTUBE_PLAYER_CLIENT');
-    if (extractorArgs && extractorArgs.trim()) {
-      baseArgs.push('--extractor-args', extractorArgs.trim());
-    } else if (playerClient && playerClient.trim()) {
-      baseArgs.push('--extractor-args', `youtube:player_client=${playerClient.trim()}`);
-    } else {
-      baseArgs.push('--extractor-args', DEFAULT_EXTRACTOR_ARGS);
-    }
 
     // Support optional YouTube cookies (via YOUTUBE_COOKIES or COOKIES_FILE env var)
     const cookiesEnv = this.configService.get<string>('YOUTUBE_COOKIES');
@@ -128,14 +158,9 @@ export class DownloaderService {
       }
     }
 
-    // An explicit proxy wins; otherwise route through the WARP tunnel when it is up
-    const proxy =
-      this.configService.get<string>('YOUTUBE_PROXY') ||
-      this.configService.get<string>('HTTP_PROXY') ||
-      this.configService.get<string>('HTTPS_PROXY') ||
-      this.warpService.getProxyUrl();
-    if (proxy && proxy.trim()) {
-      baseArgs.push('--proxy', proxy.trim());
+    const proxy = this.getProxyUrl();
+    if (proxy) {
+      baseArgs.push('--proxy', proxy);
     }
 
     return baseArgs;
@@ -149,8 +174,8 @@ export class DownloaderService {
       return cached.info;
     }
 
-    const result = await this.runYtDlpWithRotation(() => [
-      ...this.getBaseYtDlpArgs(),
+    const result = await this.runYtDlpWithRotation((extractorArgs) => [
+      ...this.getBaseYtDlpArgs(extractorArgs),
       '--dump-json',
       '--',
       normalizedUrl,
@@ -194,6 +219,7 @@ export class DownloaderService {
       format: this.defaultFormat,
       quality: this.defaultQuality,
       downloadUrl: `/api/video/download?v=${videoId}`,
+      streams: this.defaultFormat === 'mp4' ? this.selectStreams(videoId, info.formats) : undefined,
     };
 
     this.infoCache.set(videoId, { info: videoInfo, expiresAt: Date.now() + this.infoCacheTtlMs });
@@ -227,8 +253,8 @@ export class DownloaderService {
     let aborted = false;
 
     const result = await this.runYtDlpWithRotation(
-      () => {
-        const built = this.buildDownloadArgs(normalizedUrl, videoId);
+      (extractorArgs) => {
+        const built = this.buildDownloadArgs(normalizedUrl, videoId, extractorArgs);
         expectedExt = built.expectedExt;
         return built.args;
       },
@@ -264,29 +290,85 @@ export class DownloaderService {
   }
 
   /**
-   * Runs yt-dlp; if YouTube blocks the egress IP and WARP is enabled, rotates
-   * the WARP identity and retries once. Args are rebuilt for the retry so the
-   * new proxy state applies.
+   * Runs yt-dlp with each client in the fallback chain until one succeeds. If
+   * YouTube blocks the egress IP and WARP is enabled, rotates the WARP identity
+   * and retries the same client once. Args are rebuilt per attempt so the
+   * current proxy state applies.
    */
   private async runYtDlpWithRotation(
-    buildArgs: () => string[],
+    buildArgs: (extractorArgs: string) => string[],
     onChild?: (child: ChildProcess) => void,
     shouldStop?: () => boolean,
   ): Promise<YtDlpResult> {
-    const first = await this.runYtDlp(buildArgs(), onChild);
-    if (first.code === 0 || shouldStop?.() || !isBlockedError(first.stderr)) {
-      return first;
-    }
-    if (!this.warpService.isEnabled()) {
-      return first;
-    }
+    let result: YtDlpResult | null = null;
+    let rotated = false;
 
-    this.logger.warn('YouTube blocked the current egress IP; rotating WARP and retrying once.');
-    const rotated = await this.warpService.rotate();
-    if (!rotated) {
-      return first;
+    for (const extractorArgs of this.extractorArgsChain()) {
+      result = await this.runYtDlp(buildArgs(extractorArgs), onChild);
+      if (result.code === 0 || shouldStop?.()) return result;
+
+      if (isBlockedError(result.stderr) && !rotated && this.warpService.isEnabled()) {
+        rotated = true;
+        this.logger.warn('YouTube blocked the current egress IP; rotating WARP and retrying.');
+        if (await this.warpService.rotate()) {
+          result = await this.runYtDlp(buildArgs(extractorArgs), onChild);
+          if (result.code === 0 || shouldStop?.()) return result;
+        }
+      }
+      this.logger.warn(`yt-dlp failed with ${extractorArgs}: ${this.firstErrorLine(result)}`);
     }
-    return this.runYtDlp(buildArgs(), onChild);
+    return result!;
+  }
+
+  /**
+   * Picks the streams the browser relays and muxes itself: best H.264 video
+   * within the quality cap, best AAC audio, and a progressive (single-file)
+   * fallback. Only direct https formats qualify (no HLS/DASH manifests).
+   */
+  private selectStreams(videoId: string, formats: any[] | undefined): VideoStreams | undefined {
+    if (!Array.isArray(formats)) return undefined;
+    const caps: Record<string, number> = { '1080p': 1080, '720p': 720, '480p': 480 };
+    const maxHeight = caps[this.defaultQuality] ?? Infinity;
+    const direct = formats.filter((f) => f?.url && f.protocol === 'https');
+    const byQuality = (a: any, b: any) =>
+      (b.height || 0) - (a.height || 0) || (b.tbr || 0) - (a.tbr || 0);
+
+    const video = direct
+      .filter(
+        (f) =>
+          String(f.vcodec).startsWith('avc1') &&
+          f.acodec === 'none' &&
+          f.ext === 'mp4' &&
+          (f.height || 0) <= maxHeight,
+      )
+      .sort(byQuality)[0];
+    const audio = direct
+      .filter((f) => String(f.acodec).startsWith('mp4a') && f.vcodec === 'none' && f.ext === 'm4a')
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
+    const progressive = direct
+      .filter(
+        (f) => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' && f.ext === 'mp4',
+      )
+      .sort(byQuality)[0];
+
+    const describe = (f: any): StreamDescriptor | undefined => {
+      if (!f) return undefined;
+      const urlExpiry = Number(new URL(f.url).searchParams.get('expire'));
+      const fallbackExpiry = Math.floor((Date.now() + this.infoCacheTtlMs) / 1000);
+      return {
+        token: this.tokenSigner.sign({ u: f.url, v: videoId, e: urlExpiry || fallbackExpiry }),
+        height: f.height || undefined,
+        size: f.filesize || f.filesize_approx || undefined,
+        ext: f.ext,
+      };
+    };
+
+    if (!(video && audio) && !progressive) return undefined;
+    return {
+      video: video && audio ? describe(video) : undefined,
+      audio: video && audio ? describe(audio) : undefined,
+      progressive: describe(progressive),
+    };
   }
 
   private runYtDlp(args: string[], onChild?: (child: ChildProcess) => void): Promise<YtDlpResult> {
@@ -325,8 +407,9 @@ export class DownloaderService {
   private buildDownloadArgs(
     normalizedUrl: string,
     videoId: string,
+    extractorArgs: string,
   ): { args: string[]; expectedExt: string } {
-    const baseArgs = this.getBaseYtDlpArgs();
+    const baseArgs = this.getBaseYtDlpArgs(extractorArgs);
     const outputTemplate = path.join(this.storageDir, `${videoId}.%(ext)s`);
 
     if (this.defaultFormat === 'mp3') {

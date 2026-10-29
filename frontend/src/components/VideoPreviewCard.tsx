@@ -6,6 +6,7 @@ interface VideoPreviewCardProps {
   video: VideoInfo | null;
   status: DownloadStatus;
   errorMessage: string | null;
+  progress: number;
   onManualDownload: () => void;
   onReset: () => void;
 }
@@ -14,6 +15,7 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
   video,
   status,
   errorMessage,
+  progress,
   onManualDownload,
   onReset,
 }) => {
@@ -90,7 +92,12 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
 
           {/* Status banner */}
           <div className="status-banner">
-            {status === 'auto_downloading' ? (
+            {status === 'browser_downloading' ? (
+              <div className="status-item downloading">
+                <Loader2 size={18} className="spinner icon-blue" />
+                <span>Downloading in your browser... {Math.round(progress * 100)}%</span>
+              </div>
+            ) : status === 'auto_downloading' ? (
               <div className="status-item downloading">
                 <Loader2 size={18} className="spinner icon-blue" />
                 <span>Triggering your direct download automatically...</span>
@@ -110,6 +117,7 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
             <button
               onClick={onManualDownload}
               className="primary-download-button pulse-button"
+              disabled={status === 'browser_downloading'}
             >
               <Download size={20} />
               <span>

@@ -102,4 +102,10 @@ The Docker image ships `wgcf` + `wireproxy` and starts a userspace Cloudflare WA
 - **Fallback:** if the tunnel can't come up, the app still runs and connects directly
 - An explicit `YOUTUBE_PROXY` always takes precedence over WARP
 
+### In-browser downloads (no server ffmpeg, no long requests)
+
+`/api/video/info` returns signed, expiring stream tokens (H.264 video + AAC audio, plus a progressive fallback). The browser fetches each stream through `GET /api/video/stream?token=…` in bounded 4 MB `Range` chunks (relayed through WARP, since googlevideo URLs are IP-locked) and muxes them into an MP4 with [mediabunny](https://mediabunny.dev) without re-encoding. If anything fails, it falls back to the classic `/api/video/download` endpoint.
+
+The default yt-dlp client chain is `web_embedded`, then `mweb,tv` if that fails.
+
 See [`docs/WARP_DEPLOYMENT_PLAN.md`](./docs/WARP_DEPLOYMENT_PLAN.md) for the research and roadmap.

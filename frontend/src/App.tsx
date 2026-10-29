@@ -13,6 +13,7 @@ export function App() {
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<DownloadStatus>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const hasAutoTriggered = useRef(false);
 
@@ -55,6 +56,32 @@ export function App() {
     }
   };
 
+  // Preferred path: fetch streams through the relay in small chunks and build
+  // the MP4 in the browser. Falls back to the server-side download endpoint.
+  const startDownload = async (videoData: VideoInfo) => {
+    if (videoData.streams) {
+      setStatus('browser_downloading');
+      setProgress(0);
+      try {
+        // Loaded on demand: the muxer is only needed once a download starts
+        const { downloadInBrowser } = await import('./utils/browser-download');
+        await downloadInBrowser(videoData, setProgress);
+        setStatus('download_ready');
+        return;
+      } catch (err) {
+        console.warn('In-browser download failed, falling back to server download:', err);
+      }
+    }
+
+    setStatus('auto_downloading');
+    triggerBrowserDownload(videoData.id);
+
+    // Update status after short timeout to acknowledge browser trigger
+    setTimeout(() => {
+      setStatus('download_ready');
+    }, 1500);
+  };
+
   const handleLoadAndDownload = async (videoId: string) => {
     setStatus('fetching_info');
     setErrorMessage(null);
@@ -68,17 +95,7 @@ export function App() {
 
       const videoData: VideoInfo = await response.json();
       setVideo(videoData);
-
-      // Transition to auto downloading
-      setStatus('auto_downloading');
-
-      // Trigger native download
-      triggerBrowserDownload(videoId);
-
-      // Update status after short timeout to acknowledge browser trigger
-      setTimeout(() => {
-        setStatus('download_ready');
-      }, 1500);
+      await startDownload(videoData);
     } catch (err) {
       setStatus('error');
       setErrorMessage(err instanceof Error ? err.message : 'Failed to process video.');
@@ -131,7 +148,11 @@ export function App() {
         {/* Search bar is always available for convenience */}
         <UrlInput
           onSearch={handleManualSearch}
-          isLoading={status === 'fetching_info' || status === 'auto_downloading'}
+          isLoading={
+            status === 'fetching_info' ||
+            status === 'auto_downloading' ||
+            status === 'browser_downloading'
+          }
         />
 
         {/* Video preview / download card when a video is loaded */}
@@ -140,7 +161,8 @@ export function App() {
             video={video}
             status={status}
             errorMessage={errorMessage}
-            onManualDownload={() => video && triggerBrowserDownload(video.id)}
+            progress={progress}
+            onManualDownload={() => video && startDownload(video)}
             onReset={handleReset}
           />
         )}
