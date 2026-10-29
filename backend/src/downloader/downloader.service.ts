@@ -61,6 +61,8 @@ export class DownloaderService {
   private readonly infoCacheTtlMs: number;
   private readonly infoCache = new Map<string, { info: VideoInfoResponse; expiresAt: number }>();
   private readonly tokenSigner: StreamTokenSigner;
+  // Titles outlive invalidated info so fallback downloads keep a real filename
+  private readonly titles = new Map<string, string>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -223,6 +225,7 @@ export class DownloaderService {
     };
 
     this.infoCache.set(videoId, { info: videoInfo, expiresAt: Date.now() + this.infoCacheTtlMs });
+    this.titles.set(videoId, videoInfo.title);
     return videoInfo;
   }
 
@@ -401,7 +404,7 @@ export class DownloaderService {
   }
 
   private cachedTitle(videoId: string): string {
-    return this.infoCache.get(videoId)?.info.title || `YouTube_Video_${videoId}`;
+    return this.titles.get(videoId) || `YouTube_Video_${videoId}`;
   }
 
   private buildDownloadArgs(
@@ -446,19 +449,18 @@ export class DownloaderService {
       };
     }
 
-    // MP4 Video format selector based on configured quality
-    let formatSelector = 'bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b';
-
-    if (this.defaultQuality === '1080p') {
-      formatSelector =
-        'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b';
-    } else if (this.defaultQuality === '720p') {
-      formatSelector =
-        'bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b';
-    } else if (this.defaultQuality === '480p') {
-      formatSelector =
-        'bv*[height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/b';
-    }
+    // MP4 video format selector based on configured quality. H.264 (avc1) is
+    // preferred: YouTube also ships AV1 in MP4, which many players (including
+    // Windows' built-in ones) can't play without an extra codec
+    const caps: Record<string, string> = { '1080p': '1080', '720p': '720', '480p': '480' };
+    const h = caps[this.defaultQuality] ? `[height<=${caps[this.defaultQuality]}]` : '';
+    const formatSelector = [
+      `bv*${h}[vcodec^=avc1]+ba[ext=m4a]`,
+      `b${h}[vcodec^=avc1][acodec!=none]`,
+      `bv*${h}[ext=mp4]+ba[ext=m4a]`,
+      `bv*${h}+ba`,
+      'b',
+    ].join('/');
 
     return {
       args: [

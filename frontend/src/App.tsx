@@ -64,8 +64,20 @@ export function App() {
       setProgress(0);
       try {
         // Loaded on demand: the muxer is only needed once a download starts
-        const { downloadInBrowser } = await import('./utils/browser-download');
-        await downloadInBrowser(videoData, setProgress);
+        const { downloadInBrowser, StreamExpiredError } = await import('./utils/browser-download');
+        try {
+          await downloadInBrowser(videoData, setProgress);
+        } catch (err) {
+          // Links die when the server's egress IP rotates; the server has
+          // already dropped its cache, so fresh info yields working links
+          if (!(err instanceof StreamExpiredError)) throw err;
+          const fresh = await fetch(getApiUrl(`/api/video/info?v=${encodeURIComponent(videoData.id)}`));
+          if (!fresh.ok) throw err;
+          const freshData: VideoInfo = await fresh.json();
+          if (!freshData.streams) throw err;
+          setProgress(0);
+          await downloadInBrowser(freshData, setProgress);
+        }
         setStatus('download_ready');
         return;
       } catch (err) {
