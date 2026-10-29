@@ -1,19 +1,56 @@
 # Deploying YouDown on Render (Single Unified Deployment)
 
-**Both Frontend and Backend are packaged together into 1 single Web Service deployment.**
-You do **not** need two separate services or two separate URLs.
+> [!WARNING]
+> **Read Before Deploying to Render**:
+> YouTube strictly blacklists IP addresses belonging to datacenter hosting providers (Render, AWS, DigitalOcean, etc.). Deploying YouDown directly to Render on the Free Tier **will fail** with `429 Too Many Requests` or `Sign in to confirm you're not a bot` unless you configure a **Residential Proxy** or provide **YouTube Cookies**.
+>
+> Please read the [Limitations & Roadblocks on Render](#-limitations--roadblocks-on-render) section below before deploying.
 
 ---
 
-## 🎯 Why Unified Deployment is Best on Render
-- **1 Single Service**: Completely stays within Render's free tier limits (750 hours/month).
+## 🚫 Limitations & Roadblocks on Render
+
+### 1. YouTube Datacenter IP Ban (Primary Blocker)
+YouTube systematically blocks video downloads from cloud hosting data centers:
+- `HTTP Error 429: Too Many Requests`
+- Bot challenge pages (`Sign in to confirm you’re not a bot`)
+- Missing stream formats / PO Token required error
+Render routes all outgoing container traffic through its shared datacenter IPs, which YouTube aggressively flags.
+
+### 2. Free Tier Resource Limits
+- **512 MB RAM**: Video downloading and muxing with `ffmpeg` + `yt-dlp` can quickly spike memory beyond 512 MB, triggering Linux OOM (Out Of Memory) kills.
+- **100-Second Gateway Timeout**: Render's ingress proxy drops connections if a video takes longer than 100 seconds to download and process.
+- **Sleep after 15 minutes**: Free instances spin down when idle. Waking up takes 50+ seconds, causing initial URL requests to timeout.
+- **Ephemeral Storage**: All cached files in `./downloads` are wiped when the service sleeps or restarts.
+
+---
+
+## 🛠️ Mandatory Requirements for Cloud Deployment
+
+To successfully run YouDown on Render, configure the following environment variables in the Render Dashboard:
+
+| Variable | Description | Required? |
+|---|---|---|
+| `YOUTUBE_PROXY` | HTTP/SOCKS5 Residential Proxy (e.g. `http://user:pass@res-proxy.com:8080`) | **Required** on cloud datacenters |
+| `YOUTUBE_COOKIES` | Netscape format cookies exported from a logged-in residential browser session | Strongly recommended |
+| `YOUTUBE_PLAYER_CLIENT` | Override player client if needed (e.g. `android` or `mweb`) | Optional |
+| `PORT` | Set to `3000` | Handled automatically |
+
+> **Recommended Plan**: At least a **Starter** or **Standard** plan (2 GB+ RAM) with a persistent disk if you want file caching.
+
+---
+
+## 🎯 Why Unified Deployment Architecture
+
+If configured with a proxy:
+- **1 Single Service**: Frontend and Backend run together inside 1 Docker container.
 - **Zero CORS Issues**: Frontend and Backend share the exact same domain and port.
 - **Includes External Tools**: The Docker image automatically provisions `python3`, `ffmpeg`, and `yt-dlp`.
 - **Automatic SPA Routing**: Deep links like `https://youdown.onrender.com/watch?v=JYyzYnvad50` resolve to the React app automatically.
 
 ---
 
-## 🚀 Step-by-Step Deployment (Takes ~3 minutes)
+## 🚀 Step-by-Step Deployment Guide
 
 ### Option 1: Render Blueprint (Easiest - 1 Click)
 1. Push this project to your **GitHub** or **GitLab** account.
@@ -53,3 +90,16 @@ To use the URL trick on your own domain:
 3. Add the DNS records shown by Render in your domain registrar (GoDaddy, Namecheap, Cloudflare, etc.).
 4. Render automatically issues a free SSL certificate.
 5. Now, changing `youtube.com/watch?v=...` to `youdown.com/watch?v=...` opens your site and automatically downloads the video!
+
+---
+
+## 🛡️ Free Cloudflare WARP Egress (no proxy or cookies needed)
+
+The Docker image ships `wgcf` + `wireproxy` and starts a userspace Cloudflare WARP tunnel on boot (`WARP_ENABLED=true`). yt-dlp is routed through it via a local SOCKS5 proxy, so YouTube sees a Cloudflare IP instead of Render's datacenter IP. The default yt-dlp client is `web_embedded,mweb,tv`.
+
+- **Check status:** `GET /api/health` → `warp.ready`, `warp.warp` (`on`), `warp.egressIp`, `warp.colo`
+- **Self-healing:** on a bot-wall / 403 / 429 error the service registers a new WARP identity and retries once (cooldown: `WARP_ROTATE_COOLDOWN_SECONDS`, default 300)
+- **Fallback:** if the tunnel can't come up, the app still runs and connects directly
+- An explicit `YOUTUBE_PROXY` always takes precedence over WARP
+
+See [`docs/WARP_DEPLOYMENT_PLAN.md`](./docs/WARP_DEPLOYMENT_PLAN.md) for the research and roadmap.

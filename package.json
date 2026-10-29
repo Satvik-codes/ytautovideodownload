@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "YouDown - Instant YouTube Video Downloader (React + NestJS)",
   "scripts": {
+    "start": "npm --prefix backend run start:prod",
     "start:backend": "npm --prefix backend run start:prod",
     "dev:backend": "npm --prefix backend run start:dev",
     "dev:frontend": "npm --prefix frontend run dev",

@@ -73,9 +73,49 @@ Open **`http://localhost:3000`** — both the React UI and API run on port 3000!
 
 ---
 
+## ⚠️ Limitations & Why Cloud Hosting (Render, Heroku, AWS) Fails
+
+Running a YouTube downloader on cloud platforms like **Render**, **Heroku**, or standard **AWS/DigitalOcean** instances faces severe hurdles and generally **does not work reliably out-of-the-box**:
+
+### 1. 🚫 Datacenter IP Blacklisting (The Main Blocker)
+- **YouTube actively blocks datacenter IP ranges**: Google maintains an aggressive blocklist against IPs belonging to cloud providers (Render, AWS, DigitalOcean, Hetzner, OVH, etc.).
+- When requests originate from Render’s IP pool, YouTube responds with:
+  - `HTTP Error 429: Too Many Requests`
+  - `Sign in to confirm you’re not a bot`
+  - Mandatory **PO Tokens (Proof of Origin)** and bot challenge scripts that cannot be solved headless on datacenter IPs without a residential proxy.
+
+### 2. ⏳ Render Free Tier Sleep & Cold Starts
+- Render's free tier spins down web services after 15 minutes of inactivity.
+- Waking up takes **50+ seconds**. When a user uses the URL trick (`youdown.com/watch?v=...`), the browser request will either time out or abandon the download before the container even starts.
+
+### 3. 💥 Memory Limits (512 MB RAM OOM Killer)
+- Merging high-resolution video and audio streams (`ffmpeg` + `yt-dlp` + NestJS runtime) requires significant buffer memory.
+- On Render's 512 MB free tier, large or 1080p+ video processing triggers the Linux kernel **Out-Of-Memory (OOM) killer**, terminating the server mid-download.
+
+### 4. ⏱️ 100-Second Gateway Timeout
+- Render’s reverse proxy terminates any HTTP request that does not finish or stream within **100 seconds**.
+- Long videos or slower downloads will abruptly fail with `502 Bad Gateway` or `504 Gateway Timeout`.
+
+### 5. 💾 Ephemeral Disk Storage
+- Render containers do not have persistent disks on the free tier. All cached downloads and temporary chunks are lost whenever the service redeploys or restarts.
+
+---
+
+## 🛠️ How to Make Cloud Deployment Work (Workarounds)
+
+If you must deploy to Render or another cloud provider, you **must** configure:
+
+1. **Residential Proxy**:
+   Configure a residential proxy in `backend/.env` via `YOUTUBE_PROXY=http://user:pass@proxy.residential.com:port`. This routes download traffic through a home IP so YouTube will not flag it as a datacenter bot.
+2. **Exported YouTube Cookies**:
+   Supply valid cookies exported from a logged-in residential browser session via the `YOUTUBE_COOKIES` or `COOKIES_FILE` environment variable.
+3. **Upgrade Render Instance**:
+   Use at least a **Starter** or **Standard** instance (2 GB+ RAM) to avoid OOM crashes during FFmpeg stream multiplexing.
+
+> **💡 Recommended Setup**: Run YouDown **locally** on your own computer, home server, or Raspberry Pi where your residential IP is accepted by YouTube without proxies or cookies.
+
+---
+
 ## ☁️ Deploying on Render
 
-See [`RENDER_DEPLOYMENT.md`](./RENDER_DEPLOYMENT.md) for full instructions:
-1. Push to GitHub.
-2. Go to Render ➔ **New +** ➔ **Blueprint**.
-3. Select this repo. Render builds the unified Docker container and launches your site!
+See [`RENDER_DEPLOYMENT.md`](./RENDER_DEPLOYMENT.md) for full instructions and required proxy configurations.

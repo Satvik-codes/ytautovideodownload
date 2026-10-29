@@ -5,17 +5,41 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { extractAndValidateVideo } from './utils/youtube-validator.js';
 import { VideoInfoResponse, BackendSettingsResponse } from './dto/video-info.dto.js';
+import { WarpService } from './warp.service.js';
 
 export interface DownloadResult {
   filePath: string;
   title: string;
   ext: string;
   fileSize: number;
+}
+
+interface YtDlpResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+// The embedded-player client is checked less strictly than the desktop web
+// client on datacenter IPs; mweb/tv are fallbacks for non-embeddable videos.
+const DEFAULT_EXTRACTOR_ARGS = 'youtube:player_client=web_embedded,mweb,tv';
+
+// stderr patterns that mean YouTube is blocking our egress IP
+const BLOCKED_PATTERNS = [
+  /confirm you.?re not a bot/i,
+  /HTTP Error 429/i,
+  /HTTP Error 403/i,
+  /Sign in to confirm/i,
+  /This content isn.?t available, try again later/i,
+];
+
+export function isBlockedError(stderr: string): boolean {
+  return BLOCKED_PATTERNS.some((pattern) => pattern.test(stderr));
 }
 
 @Injectable()
@@ -25,8 +49,13 @@ export class DownloaderService {
   private readonly defaultFormat: string;
   private readonly defaultQuality: string;
   private readonly maxDurationSeconds: number;
+  private readonly infoCacheTtlMs: number;
+  private readonly infoCache = new Map<string, { info: VideoInfoResponse; expiresAt: number }>();
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly warpService: WarpService,
+  ) {
     this.defaultFormat = (
       this.configService.get<string>('DOWNLOAD_FORMAT') || 'mp4'
     ).toLowerCase();
@@ -37,6 +66,8 @@ export class DownloaderService {
       this.configService.get<string>('MAX_VIDEO_DURATION_SECONDS') || '10800',
       10,
     );
+    this.infoCacheTtlMs =
+      parseInt(this.configService.get<string>('INFO_CACHE_MINUTES') || '300', 10) * 60 * 1000;
 
     const configuredStorage =
       this.configService.get<string>('DOWNLOAD_STORAGE_DIR') || './downloads';
@@ -59,12 +90,22 @@ export class DownloaderService {
     const baseArgs = [
       '--no-config',
       '--no-playlist',
-      // Use TV, iOS, and Mobile Web clients (bypasses desktop WEB client bot challenge on datacenter IPs)
-      '--extractor-args',
-      'youtube:player_client=tv,ios,mweb',
+      '--js-runtimes',
+      'node',
       '--user-agent',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     ];
+
+    // Support optional extractor args or player client overrides
+    const extractorArgs = this.configService.get<string>('YOUTUBE_EXTRACTOR_ARGS');
+    const playerClient = this.configService.get<string>('YOUTUBE_PLAYER_CLIENT');
+    if (extractorArgs && extractorArgs.trim()) {
+      baseArgs.push('--extractor-args', extractorArgs.trim());
+    } else if (playerClient && playerClient.trim()) {
+      baseArgs.push('--extractor-args', `youtube:player_client=${playerClient.trim()}`);
+    } else {
+      baseArgs.push('--extractor-args', DEFAULT_EXTRACTOR_ARGS);
+    }
 
     // Support optional YouTube cookies (via YOUTUBE_COOKIES or COOKIES_FILE env var)
     const cookiesEnv = this.configService.get<string>('YOUTUBE_COOKIES');
@@ -87,11 +128,12 @@ export class DownloaderService {
       }
     }
 
-    // Support optional proxy if datacenter IP is completely blocked by YouTube
+    // An explicit proxy wins; otherwise route through the WARP tunnel when it is up
     const proxy =
       this.configService.get<string>('YOUTUBE_PROXY') ||
       this.configService.get<string>('HTTP_PROXY') ||
-      this.configService.get<string>('HTTPS_PROXY');
+      this.configService.get<string>('HTTPS_PROXY') ||
+      this.warpService.getProxyUrl();
     if (proxy && proxy.trim()) {
       baseArgs.push('--proxy', proxy.trim());
     }
@@ -102,104 +144,60 @@ export class DownloaderService {
   async getVideoInfo(input: string): Promise<VideoInfoResponse> {
     const { videoId, normalizedUrl } = extractAndValidateVideo(input);
 
-    return new Promise<VideoInfoResponse>((resolve, reject) => {
-      const args = [
-        ...this.getBaseYtDlpArgs(),
-        '--dump-json',
-        '--',
-        normalizedUrl,
-      ];
+    const cached = this.infoCache.get(videoId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.info;
+    }
 
-      const child = spawn('yt-dlp', args, { shell: false });
-      let stdoutData = '';
-      let stderrData = '';
+    const result = await this.runYtDlpWithRotation(() => [
+      ...this.getBaseYtDlpArgs(),
+      '--dump-json',
+      '--',
+      normalizedUrl,
+    ]);
 
-      child.stdout.on('data', (chunk) => {
-        stdoutData += chunk.toString();
-      });
+    if (result.code !== 0) {
+      this.logger.error(`yt-dlp exited with code ${result.code}: ${result.stderr}`);
+      throw new BadRequestException(
+        `Could not retrieve video information: ${this.firstErrorLine(result)}`,
+      );
+    }
 
-      child.stderr.on('data', (chunk) => {
-        stderrData += chunk.toString();
-      });
+    let info: any;
+    try {
+      info = JSON.parse(result.stdout.trim());
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logger.error(`JSON parse error for video info: ${msg}`);
+      throw new InternalServerErrorException('Failed to parse video metadata response.');
+    }
 
-      child.on('error', (err) => {
-        this.logger.error(`Failed to spawn yt-dlp: ${err.message}`);
-        reject(
-          new InternalServerErrorException(
-            'Failed to execute downloader engine on server.',
-          ),
-        );
-      });
+    if (info.is_live) {
+      throw new BadRequestException('Live streams cannot be downloaded as static videos.');
+    }
 
-      child.on('close', (code) => {
-        if (code !== 0) {
-          const firstErrLine =
-            stderrData
-              .split('\n')
-              .find((line) => line.includes('ERROR:'))
-              ?.replace(/^.*ERROR:\s*/, '')
-              ?.trim() ||
-            stderrData.trim() ||
-            `Exit code ${code}`;
+    const duration = Math.round(Number(info.duration) || 0);
+    if (duration > this.maxDurationSeconds) {
+      throw new BadRequestException(
+        `Video exceeds the maximum allowed duration of ${Math.round(this.maxDurationSeconds / 60)} minutes.`,
+      );
+    }
 
-          this.logger.error(`yt-dlp exited with code ${code}: ${stderrData}`);
-          return reject(
-            new BadRequestException(
-              `Could not retrieve video information: ${firstErrLine}`,
-            ),
-          );
-        }
+    const videoInfo: VideoInfoResponse = {
+      id: videoId,
+      title: (info.title || 'YouTube Video').trim(),
+      duration,
+      durationFormatted: this.formatDuration(duration),
+      author: (info.uploader || info.channel || 'Unknown Channel').trim(),
+      thumbnail: info.thumbnail || `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+      views: info.view_count,
+      format: this.defaultFormat,
+      quality: this.defaultQuality,
+      downloadUrl: `/api/video/download?v=${videoId}`,
+    };
 
-        try {
-          const info = JSON.parse(stdoutData.trim());
-
-          if (info.is_live) {
-            return reject(
-              new BadRequestException(
-                'Live streams cannot be downloaded as static videos.',
-              ),
-            );
-          }
-
-          const duration = Math.round(Number(info.duration) || 0);
-          if (duration > this.maxDurationSeconds) {
-            return reject(
-              new BadRequestException(
-                `Video exceeds the maximum allowed duration of ${Math.round(this.maxDurationSeconds / 60)} minutes.`,
-              ),
-            );
-          }
-
-          const durationFormatted = this.formatDuration(duration);
-          const title = (info.title || 'YouTube Video').trim();
-          const author = (info.uploader || info.channel || 'Unknown Channel').trim();
-          const thumbnail =
-            info.thumbnail ||
-            `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-
-          resolve({
-            id: videoId,
-            title,
-            duration,
-            durationFormatted,
-            author,
-            thumbnail,
-            views: info.view_count,
-            format: this.defaultFormat,
-            quality: this.defaultQuality,
-            downloadUrl: `/api/video/download?v=${videoId}`,
-          });
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          this.logger.error(`JSON parse error for video info: ${msg}`);
-          reject(
-            new InternalServerErrorException(
-              'Failed to parse video metadata response.',
-            ),
-          );
-        }
-      });
-    });
+    this.infoCache.set(videoId, { info: videoInfo, expiresAt: Date.now() + this.infoCacheTtlMs });
+    return videoInfo;
   }
 
   async downloadVideo(
@@ -215,79 +213,113 @@ export class DownloaderService {
       const stats = fs.statSync(finalFilePath);
       if (stats.size > 0) {
         this.logger.log(`Serving cached video for ID ${videoId} (${stats.size} bytes)`);
-        const cachedTitle = await this.quickGetTitle(videoId, normalizedUrl);
         return {
           filePath: finalFilePath,
-          title: cachedTitle,
+          title: this.cachedTitle(videoId),
           ext: targetExt,
           fileSize: stats.size,
         };
       }
     }
 
-    const { args, expectedExt } = this.buildDownloadArgs(normalizedUrl, videoId);
     this.logger.log(`Executing yt-dlp for video: ${videoId}`);
+    let expectedExt = targetExt;
+    let aborted = false;
 
-    return new Promise<DownloadResult>((resolve, reject) => {
-      const child = spawn('yt-dlp', args, { shell: false });
-      let stderrData = '';
-
-      if (registerAbort) {
-        registerAbort(() => {
+    const result = await this.runYtDlpWithRotation(
+      () => {
+        const built = this.buildDownloadArgs(normalizedUrl, videoId);
+        expectedExt = built.expectedExt;
+        return built.args;
+      },
+      (child) => {
+        registerAbort?.(() => {
+          aborted = true;
           this.logger.warn(`Client aborted download for ${videoId}. Terminating process.`);
           child.kill('SIGTERM');
           this.cleanupPartialFiles(videoId);
         });
-      }
+      },
+      () => aborted,
+    );
 
-      child.stderr.on('data', (chunk) => {
-        stderrData += chunk.toString();
-      });
+    if (result.code !== 0) {
+      this.logger.error(`Download process exited with code ${result.code}: ${result.stderr}`);
+      this.cleanupPartialFiles(videoId);
+      throw new BadRequestException(`Download failed: ${this.firstErrorLine(result)}`);
+    }
 
+    const candidateFile = path.join(this.storageDir, `${videoId}.${expectedExt}`);
+    if (!fs.existsSync(candidateFile)) {
+      this.logger.error(`Expected file not found at ${candidateFile}`);
+      throw new InternalServerErrorException('Downloaded file was not created properly.');
+    }
+
+    return {
+      filePath: candidateFile,
+      title: this.cachedTitle(videoId),
+      ext: expectedExt,
+      fileSize: fs.statSync(candidateFile).size,
+    };
+  }
+
+  /**
+   * Runs yt-dlp; if YouTube blocks the egress IP and WARP is enabled, rotates
+   * the WARP identity and retries once. Args are rebuilt for the retry so the
+   * new proxy state applies.
+   */
+  private async runYtDlpWithRotation(
+    buildArgs: () => string[],
+    onChild?: (child: ChildProcess) => void,
+    shouldStop?: () => boolean,
+  ): Promise<YtDlpResult> {
+    const first = await this.runYtDlp(buildArgs(), onChild);
+    if (first.code === 0 || shouldStop?.() || !isBlockedError(first.stderr)) {
+      return first;
+    }
+    if (!this.warpService.isEnabled()) {
+      return first;
+    }
+
+    this.logger.warn('YouTube blocked the current egress IP; rotating WARP and retrying once.');
+    const rotated = await this.warpService.rotate();
+    if (!rotated) {
+      return first;
+    }
+    return this.runYtDlp(buildArgs(), onChild);
+  }
+
+  private runYtDlp(args: string[], onChild?: (child: ChildProcess) => void): Promise<YtDlpResult> {
+    return new Promise((resolve, reject) => {
+      const child = spawn('yt-dlp', args, { shell: false });
+      let stdout = '';
+      let stderr = '';
+      onChild?.(child);
+
+      child.stdout.on('data', (chunk) => (stdout += chunk.toString()));
+      child.stderr.on('data', (chunk) => (stderr += chunk.toString()));
       child.on('error', (err) => {
-        this.logger.error(`Child process error: ${err.message}`);
-        reject(new InternalServerErrorException('Downloader failed to start.'));
+        this.logger.error(`Failed to spawn yt-dlp: ${err.message}`);
+        reject(new InternalServerErrorException('Failed to execute downloader engine on server.'));
       });
-
-      child.on('close', async (code) => {
-        if (code !== 0) {
-          const firstErrLine =
-            stderrData
-              .split('\n')
-              .find((line) => line.includes('ERROR:'))
-              ?.replace(/^.*ERROR:\s*/, '')
-              ?.trim() ||
-            stderrData.trim() ||
-            `Exit code ${code}`;
-
-          this.logger.error(`Download process exited with code ${code}: ${stderrData}`);
-          this.cleanupPartialFiles(videoId);
-          return reject(
-            new BadRequestException(
-              `Download failed: ${firstErrLine}`,
-            ),
-          );
-        }
-
-        const candidateFile = path.join(this.storageDir, `${videoId}.${expectedExt}`);
-        if (!fs.existsSync(candidateFile)) {
-          this.logger.error(`Expected file not found at ${candidateFile}`);
-          return reject(
-            new InternalServerErrorException('Downloaded file was not created properly.'),
-          );
-        }
-
-        const stats = fs.statSync(candidateFile);
-        const title = await this.quickGetTitle(videoId, normalizedUrl);
-
-        resolve({
-          filePath: candidateFile,
-          title,
-          ext: expectedExt,
-          fileSize: stats.size,
-        });
-      });
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
     });
+  }
+
+  private firstErrorLine(result: YtDlpResult): string {
+    return (
+      result.stderr
+        .split('\n')
+        .find((line) => line.includes('ERROR:'))
+        ?.replace(/^.*ERROR:\s*/, '')
+        ?.trim() ||
+      result.stderr.trim() ||
+      `Exit code ${result.code}`
+    );
+  }
+
+  private cachedTitle(videoId: string): string {
+    return this.infoCache.get(videoId)?.info.title || `YouTube_Video_${videoId}`;
   }
 
   private buildDownloadArgs(
@@ -359,30 +391,6 @@ export class DownloaderService {
       ],
       expectedExt: 'mp4',
     };
-  }
-
-  private async quickGetTitle(videoId: string, normalizedUrl: string): Promise<string> {
-    try {
-      return await new Promise<string>((resolve) => {
-        const child = spawn(
-          'yt-dlp',
-          [...this.getBaseYtDlpArgs(), '--get-title', '--', normalizedUrl],
-          { shell: false },
-        );
-        let out = '';
-        child.stdout.on('data', (c) => (out += c.toString()));
-        child.on('close', (c) => {
-          if (c === 0 && out.trim()) {
-            resolve(out.trim());
-          } else {
-            resolve(`YouTube_Video_${videoId}`);
-          }
-        });
-        child.on('error', () => resolve(`YouTube_Video_${videoId}`));
-      });
-    } catch {
-      return `YouTube_Video_${videoId}`;
-    }
   }
 
   private cleanupPartialFiles(videoId: string) {

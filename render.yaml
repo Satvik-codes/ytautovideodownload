@@ -6,16 +6,19 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     region: oregon
+    healthCheckPath: /api/health
     envVars:
       - key: PORT
         value: 10000
       - key: DOWNLOAD_FORMAT
         value: mp4
       - key: DOWNLOAD_QUALITY
-        value: best
+        value: 720p
       - key: CACHE_RETENTION_MINUTES
         value: 30
       - key: MAX_VIDEO_DURATION_SECONDS
         value: 10800
       - key: MAX_CONCURRENT_DOWNLOADS
-        value: 5
+        value: 2
+      - key: WARP_ENABLED
+        value: true
