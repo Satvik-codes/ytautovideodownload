@@ -1,8 +1,12 @@
+import { Logger } from '@nestjs/common';
 import { spawn } from 'child_process';
+import { promises as dns } from 'dns';
 import type { Response } from 'express';
 
 // Each relayed request covers at most this many bytes, keeping every HTTP
 // request short regardless of video length
+const logger = new Logger('StreamRelay');
+
 export const MAX_RELAY_CHUNK_BYTES = 4 * 1024 * 1024;
 
 export interface ByteRange {
@@ -35,10 +39,34 @@ export interface RelayOptions {
  * so the request goes through the same proxy, forcing the same address family.
  * Resolves with the upstream status code.
  */
-export function relayRange({ url, range, proxy, userAgent, res }: RelayOptions): Promise<number> {
+export async function relayRange(options: RelayOptions): Promise<number> {
+  const { url, proxy } = options;
+  let pinnedAddress: string | null = null;
+  if (proxy) {
+    // The container may have no IPv6 interface, in which case the system
+    // resolver hides AAAA records. Resolve with the DNS client instead and pin
+    // the address, so the proxy connects using the family the URL was issued for
+    const parsed = new URL(url);
+    const ipv6 = (parsed.searchParams.get('ip') || '').includes(':');
+    try {
+      const addresses = ipv6
+        ? await dns.resolve6(parsed.hostname)
+        : await dns.resolve4(parsed.hostname);
+      pinnedAddress = addresses[0] ?? null;
+    } catch {
+      pinnedAddress = null;
+    }
+  }
+  return spawnRelay(options, pinnedAddress);
+}
+
+function spawnRelay(
+  { url, range, proxy, userAgent, res }: RelayOptions,
+  pinnedAddress: string | null,
+): Promise<number> {
   return new Promise((resolve) => {
     const args = [
-      '-s',
+      '-sS',
       '-i',
       '-L',
       '--max-time',
@@ -49,10 +77,14 @@ export function relayRange({ url, range, proxy, userAgent, res }: RelayOptions):
       `Range: bytes=${range.start}-${range.end}`,
     ];
     if (proxy) {
-      // Local DNS + explicit family: the proxy connects to the exact address
-      // family the URL was issued for (WARP has separate v4 and v6 egress IPs)
-      const ipParam = new URL(url).searchParams.get('ip') || '';
-      args.push('--socks5', proxy.replace(/^socks5h?:\/\//, ''), ipParam.includes(':') ? '-6' : '-4');
+      // --socks5 hands the proxy a literal address; with --resolve pinned it is
+      // exactly the family the URL was issued for (WARP has separate v4/v6 egress IPs)
+      args.push('--socks5', proxy.replace(/^socks5h?:\/\//, ''));
+      if (pinnedAddress) {
+        const host = new URL(url).hostname;
+        const literal = pinnedAddress.includes(':') ? `[${pinnedAddress}]` : pinnedAddress;
+        args.push('--resolve', `${host}:443:${literal}`);
+      }
     }
     args.push(url);
 
@@ -60,6 +92,7 @@ export function relayRange({ url, range, proxy, userAgent, res }: RelayOptions):
     let headerBuffer = Buffer.alloc(0);
     let headersDone = false;
     let status = 0;
+    let stderr = '';
 
     res.on('close', () => child.kill('SIGTERM'));
 
@@ -93,9 +126,13 @@ export function relayRange({ url, range, proxy, userAgent, res }: RelayOptions):
       }
     });
 
+    child.stderr.on('data', (chunk) => (stderr += chunk.toString()));
     child.on('error', () => resolve(0));
-    child.on('close', () => {
+    child.on('close', (code) => {
       if (headersDone && (status === 206 || status === 200)) res.end();
+      if (!headersDone) {
+        logger.warn(`curl exit ${code}, status ${status}: ${stderr.trim() || 'no output'}`);
+      }
       resolve(status);
     });
   });
