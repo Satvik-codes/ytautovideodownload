@@ -37,7 +37,7 @@ export const UrlInput: React.FC<UrlInputProps> = ({ onSearch, isLoading }) => {
         <input
           type="text"
           className="search-input"
-          placeholder="Paste any YouTube URL or Video ID (e.g. youtube.com/watch?v=...)"
+          placeholder="Paste a YouTube or X (Twitter) video link"
           value={value}
           onChange={(e) => setValue(e.target.value)}
           disabled={isLoading}

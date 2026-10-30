@@ -4,7 +4,8 @@ import { UrlInput } from './components/UrlInput';
 import { VideoPreviewCard } from './components/VideoPreviewCard';
 import { HowItWorks } from './components/HowItWorks';
 import type { VideoInfo, BackendSettings, DownloadStatus } from './types/video';
-import { extractVideoId, detectVideoIdFromCurrentWindow } from './utils/youtube-parser';
+import { parseMediaInput, detectMediaFromCurrentWindow } from './utils/media-parser';
+import type { MediaRef } from './utils/media-parser';
 import { getApiUrl } from './config/api';
 import './App.css';
 
@@ -30,17 +31,18 @@ export function App() {
       });
   }, []);
 
-  // 2. Detect URL on mount (e.g. /watch?v=XYZ or /video?url=...)
+  // 2. Detect URL on mount (e.g. /watch?v=XYZ, /video?url=... or /user/status/ID)
   useEffect(() => {
-    const detectedId = detectVideoIdFromCurrentWindow();
-    if (detectedId && !hasAutoTriggered.current) {
+    const detected = detectMediaFromCurrentWindow();
+    if (detected && !hasAutoTriggered.current) {
       hasAutoTriggered.current = true;
-      handleLoadAndDownload(detectedId);
+      handleLoadAndDownload(detected);
     }
   }, []);
 
-  const triggerBrowserDownload = (videoId: string) => {
-    const downloadEndpoint = getApiUrl(`/api/video/download?v=${encodeURIComponent(videoId)}`);
+  const triggerBrowserDownload = (videoData: VideoInfo) => {
+    // The server builds the right fallback URL per platform (?v= or ?url=)
+    const downloadEndpoint = getApiUrl(videoData.downloadUrl);
 
     // Trigger download via hidden iframe
     if (iframeRef.current) {
@@ -56,15 +58,23 @@ export function App() {
     }
   };
 
-  // Preferred path: fetch streams through the relay in small chunks and build
-  // the MP4 in the browser. Falls back to the server-side download endpoint.
+  // Preferred path: X files come straight from X's CDN; YouTube streams come
+  // through the relay in small chunks and are muxed in the browser. Either
+  // way, failures fall back to the server-side download endpoint.
   const startDownload = async (videoData: VideoInfo) => {
     if (videoData.streams) {
       setStatus('browser_downloading');
       setProgress(0);
       try {
         // Loaded on demand: the muxer is only needed once a download starts
-        const { downloadInBrowser, StreamExpiredError } = await import('./utils/browser-download');
+        const { downloadInBrowser, downloadDirect, StreamExpiredError } = await import(
+          './utils/browser-download'
+        );
+        if (videoData.streams.direct) {
+          await downloadDirect(videoData, setProgress);
+          setStatus('download_ready');
+          return;
+        }
         try {
           await downloadInBrowser(videoData, setProgress);
         } catch (err) {
@@ -86,7 +96,7 @@ export function App() {
     }
 
     setStatus('auto_downloading');
-    triggerBrowserDownload(videoData.id);
+    triggerBrowserDownload(videoData);
 
     // Update status after short timeout to acknowledge browser trigger
     setTimeout(() => {
@@ -94,12 +104,12 @@ export function App() {
     }, 1500);
   };
 
-  const handleLoadAndDownload = async (videoId: string) => {
+  const handleLoadAndDownload = async (media: MediaRef) => {
     setStatus('fetching_info');
     setErrorMessage(null);
 
     try {
-      const response = await fetch(getApiUrl(`/api/video/info?v=${encodeURIComponent(videoId)}`));
+      const response = await fetch(getApiUrl(`/api/video/info?${media.apiQuery}`));
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.message || 'Unable to retrieve video information.');
@@ -115,16 +125,18 @@ export function App() {
   };
 
   const handleManualSearch = (input: string) => {
-    const id = extractVideoId(input);
-    if (!id) {
+    const media = parseMediaInput(input);
+    if (!media) {
       setStatus('error');
-      setErrorMessage('Please provide a valid YouTube link or 11-character video ID.');
+      setErrorMessage(
+        'Please provide a valid YouTube link, 11-character video ID, or X (Twitter) post link.',
+      );
       return;
     }
 
-    // Update URL query in address bar so user can copy/bookmark it
-    window.history.pushState(null, '', `?v=${id}`);
-    handleLoadAndDownload(id);
+    // Update the address bar so the user can copy/bookmark it
+    window.history.pushState(null, '', media.shareablePath);
+    handleLoadAndDownload(media);
   };
 
   const handleReset = () => {
@@ -153,7 +165,8 @@ export function App() {
           </h1>
           <p className="hero-subtext">
             Just change <code>youtube.com</code> to <code>youdown.com</code> in your address
-            bar, hit Enter, and your video downloads automatically!
+            bar, hit Enter, and your video downloads automatically! X (Twitter) posts work too:
+            paste the link, or swap <code>x.com</code> for your YouDown address.
           </p>
         </div>
 

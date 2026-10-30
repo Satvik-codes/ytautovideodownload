@@ -329,6 +329,11 @@
   font-weight: 700;
   line-height: 1.4;
   color: #0f172a;
+  /* X post text can be long; keep the card compact */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .video-author {

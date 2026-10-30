@@ -8,10 +8,11 @@ import { ConfigService } from '@nestjs/config';
 import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { extractAndValidateVideo } from './utils/youtube-validator.js';
+import { MediaTarget, parseMediaTarget } from './utils/media-target.js';
 import {
   VideoInfoResponse,
   BackendSettingsResponse,
+  DirectStream,
   StreamDescriptor,
   VideoStreams,
 } from './dto/video-info.dto.js';
@@ -30,6 +31,25 @@ interface YtDlpResult {
   stdout: string;
   stderr: string;
 }
+
+/** One extraction attempt: extractor settings plus whether to use the proxy. */
+interface Attempt {
+  extractorArgs: string;
+  useProxy: boolean;
+}
+
+// yt-dlp errors for X mapped to messages users can act on. `final` errors are
+// about the content itself, so further attempts can't help; login errors are
+// not final because X also returns them when it throttles an IP
+const TWITTER_ERRORS: { pattern: RegExp; message: string; final: boolean }[] = [
+  { pattern: /No video could be found/i, message: 'This post has no video.', final: true },
+  { pattern: /Domain Not Found/i, message: 'This video is no longer available on X.', final: true },
+  {
+    pattern: /(login|log in|authenticat|protected|NSFW|age-restricted)/i,
+    message: "This post requires an X login and can't be downloaded.",
+    final: false,
+  },
+];
 
 export const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
@@ -118,25 +138,43 @@ export class DownloaderService {
     this.infoCache.delete(videoId);
   }
 
-  /** Extractor-args values to try in order; env overrides disable the fallback chain. */
-  private extractorArgsChain(): string[] {
+  /** Attempts to try in order; YouTube env overrides disable its fallback chain. */
+  private attemptChain(target: MediaTarget): Attempt[] {
+    if (target.platform === 'twitter') {
+      // X's guest API may throttle WARP; the last attempt goes out directly
+      return [
+        { extractorArgs: 'twitter:api=graphql', useProxy: true },
+        { extractorArgs: 'twitter:api=syndication', useProxy: true },
+        { extractorArgs: 'twitter:api=graphql', useProxy: false },
+      ];
+    }
     const extractorArgs = this.configService.get<string>('YOUTUBE_EXTRACTOR_ARGS');
     const playerClient = this.configService.get<string>('YOUTUBE_PLAYER_CLIENT');
-    if (extractorArgs && extractorArgs.trim()) return [extractorArgs.trim()];
-    if (playerClient && playerClient.trim()) return [`youtube:player_client=${playerClient.trim()}`];
-    return DEFAULT_CLIENT_CHAIN.map((clients) => `youtube:player_client=${clients}`);
+    if (extractorArgs && extractorArgs.trim()) {
+      return [{ extractorArgs: extractorArgs.trim(), useProxy: true }];
+    }
+    if (playerClient && playerClient.trim()) {
+      return [{ extractorArgs: `youtube:player_client=${playerClient.trim()}`, useProxy: true }];
+    }
+    return DEFAULT_CLIENT_CHAIN.map((clients) => ({
+      extractorArgs: `youtube:player_client=${clients}`,
+      useProxy: true,
+    }));
   }
 
-  private getBaseYtDlpArgs(extractorArgs: string): string[] {
+  private getBaseYtDlpArgs(target: MediaTarget, attempt: Attempt): string[] {
     const baseArgs = [
       '--no-config',
-      '--no-playlist',
+      // X posts with several videos are playlists; pick the requested clip
+      ...(target.platform === 'twitter'
+        ? ['--playlist-items', String(target.index ?? 1)]
+        : ['--no-playlist']),
       '--js-runtimes',
       'node',
       '--user-agent',
       USER_AGENT,
       '--extractor-args',
-      extractorArgs,
+      attempt.extractorArgs,
     ];
 
     // Support optional YouTube cookies (via YOUTUBE_COOKIES or COOKIES_FILE env var)
@@ -160,7 +198,7 @@ export class DownloaderService {
       }
     }
 
-    const proxy = this.getProxyUrl();
+    const proxy = attempt.useProxy ? this.getProxyUrl() : null;
     if (proxy) {
       baseArgs.push('--proxy', proxy);
     }
@@ -169,31 +207,40 @@ export class DownloaderService {
   }
 
   async getVideoInfo(input: string): Promise<VideoInfoResponse> {
-    const { videoId, normalizedUrl } = extractAndValidateVideo(input);
+    const target = parseMediaTarget(input);
+    const key = target.storageKey;
 
-    const cached = this.infoCache.get(videoId);
+    const cached = this.infoCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       return cached.info;
     }
 
-    const result = await this.runYtDlpWithRotation((extractorArgs) => [
-      ...this.getBaseYtDlpArgs(extractorArgs),
+    const result = await this.runYtDlpWithRotation(target, (attempt) => [
+      ...this.getBaseYtDlpArgs(target, attempt),
       '--dump-json',
       '--',
-      normalizedUrl,
+      target.normalizedUrl,
     ]);
 
     if (result.code !== 0) {
       this.logger.error(`yt-dlp exited with code ${result.code}: ${result.stderr}`);
       throw new BadRequestException(
-        `Could not retrieve video information: ${this.firstErrorLine(result)}`,
+        `Could not retrieve video information: ${this.firstErrorLine(result, target)}`,
       );
     }
 
     let info: any;
     try {
-      info = JSON.parse(result.stdout.trim());
+      // One JSON object per line; a playlist-item selection yields exactly one
+      const lines = result.stdout.trim().split('\n').filter(Boolean);
+      if (!lines.length) {
+        throw new BadRequestException(
+          target.platform === 'twitter' ? 'This post has no video.' : 'No video found.',
+        );
+      }
+      info = JSON.parse(lines[lines.length - 1]);
     } catch (e) {
+      if (e instanceof BadRequestException) throw e;
       const msg = e instanceof Error ? e.message : String(e);
       this.logger.error(`JSON parse error for video info: ${msg}`);
       throw new InternalServerErrorException('Failed to parse video metadata response.');
@@ -210,63 +257,84 @@ export class DownloaderService {
       );
     }
 
+    const isTwitter = target.platform === 'twitter';
     const videoInfo: VideoInfoResponse = {
-      id: videoId,
-      title: (info.title || 'YouTube Video').trim(),
+      id: target.id,
+      platform: target.platform,
+      title: String(info.title || (isTwitter ? 'X Video' : 'YouTube Video'))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200),
       duration,
       durationFormatted: this.formatDuration(duration),
-      author: (info.uploader || info.channel || 'Unknown Channel').trim(),
-      thumbnail: info.thumbnail || `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+      author: (info.uploader || info.channel || 'Unknown').trim(),
+      thumbnail:
+        info.thumbnail || (isTwitter ? '' : `https://img.youtube.com/vi/${target.id}/hqdefault.jpg`),
       views: info.view_count,
       format: this.defaultFormat,
       quality: this.defaultQuality,
-      downloadUrl: `/api/video/download?v=${videoId}`,
-      streams: this.defaultFormat === 'mp4' ? this.selectStreams(videoId, info.formats) : undefined,
+      downloadUrl: isTwitter
+        ? `/api/video/download?url=${encodeURIComponent(this.shareableTwitterUrl(target))}`
+        : `/api/video/download?v=${target.id}`,
+      streams:
+        this.defaultFormat !== 'mp4'
+          ? undefined
+          : isTwitter
+            ? this.selectDirectStream(info.formats)
+            : this.selectStreams(target.id, info.formats),
     };
 
-    this.infoCache.set(videoId, { info: videoInfo, expiresAt: Date.now() + this.infoCacheTtlMs });
-    this.titles.set(videoId, videoInfo.title);
+    this.infoCache.set(key, { info: videoInfo, expiresAt: Date.now() + this.infoCacheTtlMs });
+    this.titles.set(key, videoInfo.title);
     return videoInfo;
+  }
+
+  /** A post URL that parseMediaTarget accepts and that keeps the clip index. */
+  private shareableTwitterUrl(target: MediaTarget): string {
+    const index = target.index && target.index > 1 ? `/video/${target.index}` : '';
+    return `https://x.com/i/status/${target.id}${index}`;
   }
 
   async downloadVideo(
     input: string,
     registerAbort?: (abortFn: () => void) => void,
   ): Promise<DownloadResult> {
-    const { videoId, normalizedUrl } = extractAndValidateVideo(input);
+    const target = parseMediaTarget(input);
+    const key = target.storageKey;
     const targetExt = this.defaultFormat === 'mp3' ? 'mp3' : 'mp4';
-    const finalFilePath = path.join(this.storageDir, `${videoId}.${targetExt}`);
+    const finalFilePath = path.join(this.storageDir, `${key}.${targetExt}`);
 
     // If already downloaded and cached, return immediately
     if (fs.existsSync(finalFilePath)) {
       const stats = fs.statSync(finalFilePath);
       if (stats.size > 0) {
-        this.logger.log(`Serving cached video for ID ${videoId} (${stats.size} bytes)`);
+        this.logger.log(`Serving cached video for ${key} (${stats.size} bytes)`);
         return {
           filePath: finalFilePath,
-          title: this.cachedTitle(videoId),
+          title: this.cachedTitle(key),
           ext: targetExt,
           fileSize: stats.size,
         };
       }
     }
 
-    this.logger.log(`Executing yt-dlp for video: ${videoId}`);
+    this.logger.log(`Executing yt-dlp for ${key}`);
     let expectedExt = targetExt;
     let aborted = false;
 
     const result = await this.runYtDlpWithRotation(
-      (extractorArgs) => {
-        const built = this.buildDownloadArgs(normalizedUrl, videoId, extractorArgs);
+      target,
+      (attempt) => {
+        const built = this.buildDownloadArgs(target, attempt);
         expectedExt = built.expectedExt;
         return built.args;
       },
       (child) => {
         registerAbort?.(() => {
           aborted = true;
-          this.logger.warn(`Client aborted download for ${videoId}. Terminating process.`);
+          this.logger.warn(`Client aborted download for ${key}. Terminating process.`);
           child.kill('SIGTERM');
-          this.cleanupPartialFiles(videoId);
+          this.cleanupPartialFiles(key);
         });
       },
       () => aborted,
@@ -274,11 +342,11 @@ export class DownloaderService {
 
     if (result.code !== 0) {
       this.logger.error(`Download process exited with code ${result.code}: ${result.stderr}`);
-      this.cleanupPartialFiles(videoId);
-      throw new BadRequestException(`Download failed: ${this.firstErrorLine(result)}`);
+      this.cleanupPartialFiles(key);
+      throw new BadRequestException(`Download failed: ${this.firstErrorLine(result, target)}`);
     }
 
-    const candidateFile = path.join(this.storageDir, `${videoId}.${expectedExt}`);
+    const candidateFile = path.join(this.storageDir, `${key}.${expectedExt}`);
     if (!fs.existsSync(candidateFile)) {
       this.logger.error(`Expected file not found at ${candidateFile}`);
       throw new InternalServerErrorException('Downloaded file was not created properly.');
@@ -286,41 +354,83 @@ export class DownloaderService {
 
     return {
       filePath: candidateFile,
-      title: this.cachedTitle(videoId),
+      title: this.cachedTitle(key),
       ext: expectedExt,
       fileSize: fs.statSync(candidateFile).size,
     };
   }
 
   /**
-   * Runs yt-dlp with each client in the fallback chain until one succeeds. If
-   * YouTube blocks the egress IP and WARP is enabled, rotates the WARP identity
-   * and retries the same client once. Args are rebuilt per attempt so the
+   * Runs yt-dlp with each attempt in the platform's chain until one succeeds.
+   * If the egress IP is blocked and WARP is enabled, rotates the WARP identity
+   * and retries the same attempt once. Args are rebuilt per attempt so the
    * current proxy state applies.
    */
   private async runYtDlpWithRotation(
-    buildArgs: (extractorArgs: string) => string[],
+    target: MediaTarget,
+    buildArgs: (attempt: Attempt) => string[],
     onChild?: (child: ChildProcess) => void,
     shouldStop?: () => boolean,
   ): Promise<YtDlpResult> {
     let result: YtDlpResult | null = null;
     let rotated = false;
 
-    for (const extractorArgs of this.extractorArgsChain()) {
-      result = await this.runYtDlp(buildArgs(extractorArgs), onChild);
-      if (result.code === 0 || shouldStop?.()) return result;
+    for (const attempt of this.attemptChain(target)) {
+      result = await this.runYtDlp(buildArgs(attempt), onChild);
+      if (result.code === 0 || shouldStop?.()) {
+        if (result.code === 0 && target.platform === 'twitter') {
+          this.logger.log(`X extraction succeeded via ${attempt.extractorArgs} (proxy: ${attempt.useProxy})`);
+        }
+        return result;
+      }
 
-      if (isBlockedError(result.stderr) && !rotated && this.warpService.isEnabled()) {
+      if (attempt.useProxy && isBlockedError(result.stderr) && !rotated && this.warpService.isEnabled()) {
         rotated = true;
-        this.logger.warn('YouTube blocked the current egress IP; rotating WARP and retrying.');
+        this.logger.warn('Egress IP blocked; rotating WARP and retrying.');
         if (await this.warpService.rotate()) {
-          result = await this.runYtDlp(buildArgs(extractorArgs), onChild);
+          result = await this.runYtDlp(buildArgs(attempt), onChild);
           if (result.code === 0 || shouldStop?.()) return result;
         }
       }
-      this.logger.warn(`yt-dlp failed with ${extractorArgs}: ${this.firstErrorLine(result)}`);
+      this.logger.warn(
+        `yt-dlp failed with ${attempt.extractorArgs} (proxy: ${attempt.useProxy}): ${this.firstErrorLine(result)}`,
+      );
+      // Content errors (no video, deleted) won't change with another attempt
+      if (target.platform === 'twitter' && this.matchTwitterError(result)?.final) break;
     }
     return result!;
+  }
+
+  /**
+   * X serves single-file MP4s from video.twimg.com that are neither signed
+   * nor IP-locked and allow CORS, so the browser downloads them directly.
+   */
+  private selectDirectStream(formats: any[] | undefined): VideoStreams | undefined {
+    if (!Array.isArray(formats)) return undefined;
+    const caps: Record<string, number> = { '1080p': 1080, '720p': 720, '480p': 480 };
+    const maxHeight = caps[this.defaultQuality] ?? Infinity;
+    const candidates = formats.filter((f) => {
+      if (!f?.url || f.protocol !== 'https' || f.ext !== 'mp4') return false;
+      try {
+        return new URL(f.url).hostname === 'video.twimg.com';
+      } catch {
+        return false;
+      }
+    });
+    const byHeight = (a: any, b: any) =>
+      (b.height || 0) - (a.height || 0) || (b.tbr || 0) - (a.tbr || 0);
+    const best =
+      candidates.filter((f) => (f.height || 0) <= maxHeight).sort(byHeight)[0] ??
+      candidates.sort(byHeight).at(-1);
+    if (!best) return undefined;
+
+    const direct: DirectStream = {
+      url: best.url,
+      height: best.height || undefined,
+      size: best.filesize || best.filesize_approx || undefined,
+      ext: 'mp4',
+    };
+    return { direct };
   }
 
   /**
@@ -391,7 +501,11 @@ export class DownloaderService {
     });
   }
 
-  private firstErrorLine(result: YtDlpResult): string {
+  private firstErrorLine(result: YtDlpResult, target?: MediaTarget): string {
+    if (target?.platform === 'twitter') {
+      const friendly = this.matchTwitterError(result);
+      if (friendly) return friendly.message;
+    }
     return (
       result.stderr
         .split('\n')
@@ -403,17 +517,26 @@ export class DownloaderService {
     );
   }
 
-  private cachedTitle(videoId: string): string {
-    return this.titles.get(videoId) || `YouTube_Video_${videoId}`;
+  private matchTwitterError(result: YtDlpResult) {
+    const errorLines = result.stderr
+      .split('\n')
+      .filter((line) => line.includes('ERROR:'))
+      .join('\n');
+    return TWITTER_ERRORS.find(({ pattern }) => pattern.test(errorLines)) ?? null;
+  }
+
+  private cachedTitle(key: string): string {
+    const fallback = key.startsWith('tw_') ? `X_Video_${key.slice(3)}` : `YouTube_Video_${key}`;
+    return this.titles.get(key) || fallback;
   }
 
   private buildDownloadArgs(
-    normalizedUrl: string,
-    videoId: string,
-    extractorArgs: string,
+    target: MediaTarget,
+    attempt: Attempt,
   ): { args: string[]; expectedExt: string } {
-    const baseArgs = this.getBaseYtDlpArgs(extractorArgs);
-    const outputTemplate = path.join(this.storageDir, `${videoId}.%(ext)s`);
+    const normalizedUrl = target.normalizedUrl;
+    const baseArgs = this.getBaseYtDlpArgs(target, attempt);
+    const outputTemplate = path.join(this.storageDir, `${target.storageKey}.%(ext)s`);
 
     if (this.defaultFormat === 'mp3') {
       return {
@@ -454,13 +577,18 @@ export class DownloaderService {
     // Windows' built-in ones) can't play without an extra codec
     const caps: Record<string, string> = { '1080p': '1080', '720p': '720', '480p': '480' };
     const h = caps[this.defaultQuality] ? `[height<=${caps[this.defaultQuality]}]` : '';
-    const formatSelector = [
-      `bv*${h}[vcodec^=avc1]+ba[ext=m4a]`,
-      `b${h}[vcodec^=avc1][acodec!=none]`,
-      `bv*${h}[ext=mp4]+ba[ext=m4a]`,
-      `bv*${h}+ba`,
-      'b',
-    ].join('/');
+    // X ships single-file H.264 MP4s over https; prefer those over its HLS variants
+    const formatSelector = (
+      target.platform === 'twitter'
+        ? [`b${h}[protocol=https][ext=mp4]`, 'b[protocol=https][ext=mp4]', 'b[ext=mp4]', 'b']
+        : [
+            `bv*${h}[vcodec^=avc1]+ba[ext=m4a]`,
+            `b${h}[vcodec^=avc1][acodec!=none]`,
+            `bv*${h}[ext=mp4]+ba[ext=m4a]`,
+            `bv*${h}+ba`,
+            'b',
+          ]
+    ).join('/');
 
     return {
       args: [

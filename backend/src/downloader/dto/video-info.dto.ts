@@ -1,5 +1,6 @@
 export class VideoInfoResponse {
   id: string;
+  platform: 'youtube' | 'twitter';
   title: string;
   duration: number;
   durationFormatted: string;
@@ -20,10 +21,19 @@ export class StreamDescriptor {
   ext: string;
 }
 
+/** A public, non-IP-locked CDN file the browser can fetch directly (X). */
+export class DirectStream {
+  url: string;
+  height?: number;
+  size?: number;
+  ext: string;
+}
+
 export class VideoStreams {
   video?: StreamDescriptor;
   audio?: StreamDescriptor;
   progressive?: StreamDescriptor;
+  direct?: DirectStream;
 }
 
 export class BackendSettingsResponse {

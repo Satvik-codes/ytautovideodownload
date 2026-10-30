@@ -122,6 +122,43 @@ export async function downloadInBrowser(
   onProgress(1);
 }
 
+/**
+ * X serves public single-file MP4s from its CDN with CORS enabled, so the
+ * browser fetches the file directly: no relay, no muxing, no server load.
+ * Content-Range isn't exposed cross-origin, so it's one whole-file request.
+ */
+export async function downloadDirect(
+  video: VideoInfo,
+  onProgress: (fraction: number) => void,
+): Promise<void> {
+  const stream = video.streams?.direct;
+  if (!stream) throw new Error('No direct stream.');
+
+  // video.twimg.com rejects requests whose Referer is another site (hotlink
+  // protection) but accepts ones without a Referer
+  const res = await fetch(stream.url, {
+    mode: 'cors',
+    credentials: 'omit',
+    referrerPolicy: 'no-referrer',
+  });
+  if (!res.ok || !res.body) throw new Error(`Direct download failed (${res.status})`);
+
+  const total = Number(res.headers.get('Content-Length')) || stream.size || 0;
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    received += value.byteLength;
+    if (total) onProgress(Math.min(received / total, 0.99));
+  }
+
+  saveBlob(new Blob(parts as BlobPart[], { type: 'video/mp4' }), `${safeFilename(video.title)}.mp4`);
+  onProgress(1);
+}
+
 async function muxStreams(
   videoStream: StreamDescriptor,
   audioStream: StreamDescriptor,

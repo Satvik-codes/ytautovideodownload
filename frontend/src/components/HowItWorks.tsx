@@ -51,6 +51,8 @@ export const HowItWorks: React.FC = () => {
             <h3 className="step-title">Instant Automatic Download</h3>
             <p className="step-desc">
               You land right here, and your file begins downloading automatically with zero clicks!
+              Works for X posts too: <code>x.com/user/status/123</code> →{' '}
+              <code>youdown.com/user/status/123</code>.
             </p>
             <div className="instant-badge">
               <Zap size={16} className="zap-icon" />

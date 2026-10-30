@@ -109,3 +109,13 @@ The Docker image ships `wgcf` + `wireproxy` and starts a userspace Cloudflare WA
 The default yt-dlp client chain is `web_embedded`, then `mweb,tv` if that fails.
 
 See [`docs/WARP_DEPLOYMENT_PLAN.md`](./docs/WARP_DEPLOYMENT_PLAN.md) for the research and roadmap.
+
+---
+
+## 🐦 X (Twitter) Support
+
+The same input box (and the URL trick `x.com/USER/status/ID` → `<your-app>/USER/status/ID`) accepts X post links.
+
+- **Extraction:** yt-dlp tries `twitter:api=graphql` via WARP, then `twitter:api=syndication` via WARP, then `graphql` directly from Render's IP (in case X throttles WARP). The log line `X extraction succeeded via …` shows which one worked.
+- **Download:** X's `video.twimg.com` MP4s aren't IP-locked and allow CORS, so the browser fetches them directly (sent without a `Referer`, since X's CDN blocks hotlinking from other sites). The server download endpoint is the fallback.
+- **Limits:** protected/age-gated posts, Spaces/broadcasts, and `t.co` short links aren't supported. X changes its guest API often; redeploying pulls the latest yt-dlp.

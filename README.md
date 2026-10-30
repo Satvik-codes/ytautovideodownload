@@ -20,7 +20,11 @@ Just like deleting "ube" in `yout.com`, YouDown lets you download videos directl
 - `/video?url=https://www.youtube.com/watch?v=...` (yout.com style)
 - `/shorts/VIDEO_ID` (YouTube Shorts)
 - `/?v=VIDEO_ID`
-- Direct paste in the homepage search box
+- `/USER/status/POST_ID` (X / Twitter: swap `x.com` for your YouDown address)
+- Direct paste in the homepage search box (YouTube or X links)
+
+### X (Twitter) Videos
+Paste any public `x.com` / `twitter.com` post link (mobile, `fxtwitter`/`vxtwitter` mirrors and `/video/2` clip selection are supported). X serves ready-made H.264 MP4s that are neither signed nor IP-locked, so the server only fetches metadata and **the browser downloads the file straight from X's CDN**. No relay or muxing is needed. Not supported: protected or age-gated posts, Spaces/broadcasts, and `t.co` short links (paste the full post link instead).
 
 ---
 

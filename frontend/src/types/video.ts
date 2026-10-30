@@ -1,5 +1,6 @@
 export interface VideoInfo {
   id: string;
+  platform: 'youtube' | 'twitter';
   title: string;
   duration: number;
   durationFormatted: string;
@@ -19,10 +20,19 @@ export interface StreamDescriptor {
   ext: string;
 }
 
+/** A public CDN file the browser fetches directly (X) */
+export interface DirectStream {
+  url: string;
+  height?: number;
+  size?: number;
+  ext: string;
+}
+
 export interface VideoStreams {
   video?: StreamDescriptor;
   audio?: StreamDescriptor;
   progressive?: StreamDescriptor;
+  direct?: DirectStream;
 }
 
 export interface BackendSettings {

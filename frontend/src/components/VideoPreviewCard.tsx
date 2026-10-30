@@ -72,6 +72,9 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
         <div className="video-info">
           <div className="video-badge-row">
             <span className="badge-pill format-pill">
+              {video.platform === 'twitter' ? 'X' : 'YouTube'}
+            </span>
+            <span className="badge-pill format-pill">
               {video.format.toUpperCase()}
             </span>
             <span className="badge-pill quality-pill">
@@ -88,7 +91,7 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
             {video.title}
           </h2>
 
-          <p className="video-author">Channel: {video.author}</p>
+          <p className="video-author">By: {video.author}</p>
 
           {/* Status banner */}
           <div className="status-banner">
