@@ -1,13 +1,11 @@
 import React from 'react';
-import { DownloadCloud, Sparkles } from 'lucide-react';
-import type { BackendSettings } from '../types/video';
+import { DownloadCloud } from 'lucide-react';
 
 interface HeaderProps {
-  settings: BackendSettings | null;
   onReset: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ settings, onReset }) => {
+export const Header: React.FC<HeaderProps> = ({ onReset }) => {
   return (
     <header className="header-container">
       <div className="header-content">
@@ -22,15 +20,6 @@ export const Header: React.FC<HeaderProps> = ({ settings, onReset }) => {
             <span className="brand-tagline">Instant One-Click Video Downloader</span>
           </div>
         </div>
-
-        {settings && (
-          <div className="settings-pill" title="Uniform backend configuration from .env">
-            <Sparkles size={14} className="sparkle-icon" />
-            <span>
-              Preset: <strong>{settings.format.toUpperCase()}</strong> ({settings.quality})
-            </span>
-          </div>
-        )}
       </div>
     </header>
   );

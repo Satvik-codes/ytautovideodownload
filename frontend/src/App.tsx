@@ -2,15 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { Header } from './components/Header';
 import { UrlInput } from './components/UrlInput';
 import { VideoPreviewCard } from './components/VideoPreviewCard';
-import { HowItWorks } from './components/HowItWorks';
-import type { VideoInfo, BackendSettings, DownloadStatus } from './types/video';
+import type { VideoInfo, DownloadStatus } from './types/video';
 import { parseMediaInput, detectMediaFromCurrentWindow } from './utils/media-parser';
 import type { MediaRef } from './utils/media-parser';
 import { getApiUrl } from './config/api';
 import './App.css';
 
 export function App() {
-  const [settings, setSettings] = useState<BackendSettings | null>(null);
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<DownloadStatus>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -18,20 +16,7 @@ export function App() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const hasAutoTriggered = useRef(false);
 
-  // 1. Fetch backend settings on startup
-  useEffect(() => {
-    fetch(getApiUrl('/api/video/settings'))
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: BackendSettings | null) => {
-        if (data) setSettings(data);
-      })
-      .catch(() => {
-        // Fallback default
-        setSettings({ format: 'mp4', quality: 'best', maxDurationSeconds: 10800 });
-      });
-  }, []);
-
-  // 2. Detect URL on mount (e.g. /watch?v=XYZ, /video?url=... or /user/status/ID)
+  // Detect URL on mount (e.g. /watch?v=XYZ, /video?url=... or /user/status/ID)
   useEffect(() => {
     const detected = detectMediaFromCurrentWindow();
     if (detected && !hasAutoTriggered.current) {
@@ -156,7 +141,7 @@ export function App() {
         title="download-frame"
       />
 
-      <Header settings={settings} onReset={handleReset} />
+      <Header onReset={handleReset} />
 
       <main className="main-content">
         <div className="hero-banner">
@@ -164,9 +149,8 @@ export function App() {
             Download Any YouTube Video <span className="hero-accent">Instantly</span>
           </h1>
           <p className="hero-subtext">
-            Just change <code>youtube.com</code> to <code>youdown.com</code> in your address
-            bar, hit Enter, and your video downloads automatically! X (Twitter) posts work too:
-            paste the link, or swap <code>x.com</code> for your YouDown address.
+            Paste a YouTube or X link, or swap <code>youtube.com</code> / <code>x.com</code> for
+            YouDown in your address bar.
           </p>
         </div>
 
@@ -191,9 +175,6 @@ export function App() {
             onReset={handleReset}
           />
         )}
-
-        {/* How it works visual guide */}
-        <HowItWorks />
       </main>
 
       <footer className="footer-container">
