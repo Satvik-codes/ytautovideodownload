@@ -12,6 +12,7 @@ import {
 import type { InputAudioTrack, InputVideoTrack } from 'mediabunny';
 import type { StreamDescriptor, VideoInfo } from '../types/video';
 import { getApiUrl } from '../config/api';
+import { readBody, safeFilename, saveBlob } from './save-file';
 
 // Matches the server's MAX_RELAY_CHUNK_BYTES: every relay request is bounded,
 // so no single HTTP request runs long enough to hit the host's timeout
@@ -92,10 +93,17 @@ const chunkedFetch: typeof fetch = async (input, init) => {
   });
 };
 
-const openInput = (stream: StreamDescriptor) =>
+const openInput = (stream: StreamDescriptor, signal: AbortSignal) =>
   new Input({
     formats: ALL_FORMATS,
-    source: new UrlSource(streamUrl(stream), { fetchFn: chunkedFetch, getRetryDelay: () => null }),
+    source: new UrlSource(streamUrl(stream), {
+      fetchFn: (input, init) =>
+        chunkedFetch(input, {
+          ...init,
+          signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal,
+        }),
+      getRetryDelay: () => null,
+    }),
   });
 
 /**
@@ -106,6 +114,7 @@ const openInput = (stream: StreamDescriptor) =>
 export async function downloadInBrowser(
   video: VideoInfo,
   height: number | undefined,
+  signal: AbortSignal,
   onProgress: (fraction: number) => void,
 ): Promise<void> {
   const streams = video.streams;
@@ -114,9 +123,9 @@ export async function downloadInBrowser(
   const videoStream = streams.videos?.find((s) => s.height === height) ?? streams.video;
   const blob =
     videoStream && streams.audio
-      ? await muxStreams(videoStream, streams.audio, video.duration, onProgress)
+      ? await muxStreams(videoStream, streams.audio, video.duration, signal, onProgress)
       : streams.progressive
-        ? await fetchWhole(streams.progressive, onProgress)
+        ? await fetchWhole(streams.progressive, signal, onProgress)
         : null;
   if (!blob) throw new Error('No browser-downloadable streams.');
 
@@ -132,6 +141,7 @@ export async function downloadInBrowser(
 export async function downloadDirect(
   video: VideoInfo,
   height: number | undefined,
+  signal: AbortSignal,
   onProgress: (fraction: number) => void,
 ): Promise<void> {
   const stream = video.streams?.directs?.find((s) => s.height === height) ?? video.streams?.direct;
@@ -143,22 +153,12 @@ export async function downloadDirect(
     mode: 'cors',
     credentials: 'omit',
     referrerPolicy: 'no-referrer',
+    signal,
   });
   if (!res.ok || !res.body) throw new Error(`Direct download failed (${res.status})`);
 
-  const total = Number(res.headers.get('Content-Length')) || stream.size || 0;
-  const reader = res.body.getReader();
-  const parts: Uint8Array[] = [];
-  let received = 0;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    received += value.byteLength;
-    if (total) onProgress(Math.min(received / total, 0.99));
-  }
-
-  saveBlob(new Blob(parts as BlobPart[], { type: 'video/mp4' }), `${safeFilename(video.title)}.mp4`);
+  const blob = await readBody(res, 'video/mp4', stream.size, onProgress);
+  saveBlob(blob, `${safeFilename(video.title)}.mp4`);
   onProgress(1);
 }
 
@@ -168,27 +168,32 @@ export async function downloadDirect(
  */
 export async function downloadAudioInBrowser(
   video: VideoInfo,
+  signal: AbortSignal,
   onProgress: (fraction: number) => void,
 ): Promise<void> {
   const stream = video.streams?.audio;
   if (!stream) throw new Error('No browser-downloadable audio stream.');
 
-  const input = openInput(stream);
+  const input = openInput(stream, signal);
+  let output: Output | null = null;
   try {
     const track = await input.getPrimaryAudioTrack();
     if (!track?.codec) throw new Error('Unsupported audio codec.');
 
     const target = new BufferTarget();
-    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+    output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
     const source = new EncodedAudioPacketSource(track.codec);
     output.addAudioTrack(source);
     await output.start();
-    await copyPackets(track, source, (t) => video.duration > 0 && onProgress(Math.min(t / video.duration, 0.99)));
+    await copyPackets(track, source, signal, (t) => video.duration > 0 && onProgress(Math.min(t / video.duration, 0.99)));
     await output.finalize();
 
     if (!target.buffer) throw new Error('Packaging produced no output.');
     saveBlob(new Blob([target.buffer], { type: 'audio/mp4' }), `${safeFilename(video.title)}.m4a`);
     onProgress(1);
+  } catch (err) {
+    await cancelOutput(output);
+    throw err;
   } finally {
     input.dispose();
   }
@@ -198,17 +203,19 @@ async function muxStreams(
   videoStream: StreamDescriptor,
   audioStream: StreamDescriptor,
   duration: number,
+  signal: AbortSignal,
   onProgress: (fraction: number) => void,
 ): Promise<Blob> {
-  const videoInput = openInput(videoStream);
-  const audioInput = openInput(audioStream);
+  const videoInput = openInput(videoStream, signal);
+  const audioInput = openInput(audioStream, signal);
+  let output: Output | null = null;
   try {
     const videoTrack = await videoInput.getPrimaryVideoTrack();
     const audioTrack = await audioInput.getPrimaryAudioTrack();
     if (!videoTrack?.codec || !audioTrack?.codec) throw new Error('Unsupported stream codecs.');
 
     const target = new BufferTarget();
-    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+    output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
     const videoSource = new EncodedVideoPacketSource(videoTrack.codec);
     const audioSource = new EncodedAudioPacketSource(audioTrack.codec);
     output.addVideoTrack(videoSource);
@@ -217,13 +224,16 @@ async function muxStreams(
 
     // Pump both tracks concurrently; add() backpressure keeps them interleaved
     await Promise.all([
-      copyPackets(videoTrack, videoSource, (t) => duration > 0 && onProgress(Math.min(t / duration, 0.99))),
-      copyPackets(audioTrack, audioSource),
+      copyPackets(videoTrack, videoSource, signal, (t) => duration > 0 && onProgress(Math.min(t / duration, 0.99))),
+      copyPackets(audioTrack, audioSource, signal),
     ]);
     await output.finalize();
 
     if (!target.buffer) throw new Error('Muxing produced no output.');
     return new Blob([target.buffer], { type: 'video/mp4' });
+  } catch (err) {
+    await cancelOutput(output);
+    throw err;
   } finally {
     videoInput.dispose();
     audioInput.dispose();
@@ -233,11 +243,13 @@ async function muxStreams(
 async function copyPackets(
   track: InputVideoTrack | InputAudioTrack,
   source: EncodedVideoPacketSource | EncodedAudioPacketSource,
+  signal: AbortSignal,
   onTimestamp?: (seconds: number) => void,
 ) {
   const decoderConfig = await track.getDecoderConfig();
   let first = true;
   for await (const packet of new EncodedPacketSink(track).packets()) {
+    signal.throwIfAborted();
     // The first packet carries the decoder config the muxer needs for the track header
     const meta = first && decoderConfig ? { decoderConfig } : undefined;
     if (source instanceof EncodedVideoPacketSource) {
@@ -252,33 +264,18 @@ async function copyPackets(
 }
 
 /** Single-file (progressive) stream: no muxing, just chunked download. */
-async function fetchWhole(stream: StreamDescriptor, onProgress: (fraction: number) => void) {
-  const res = await chunkedFetch(streamUrl(stream), { headers: { Range: 'bytes=0-' } });
-  const total = Number(res.headers.get('Content-Length')) || stream.size || 0;
-  const reader = res.body!.getReader();
-  const parts: Uint8Array[] = [];
-  let received = 0;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    received += value.byteLength;
-    if (total) onProgress(Math.min(received / total, 0.99));
+async function fetchWhole(
+  stream: StreamDescriptor,
+  signal: AbortSignal,
+  onProgress: (fraction: number) => void,
+) {
+  const res = await chunkedFetch(streamUrl(stream), { headers: { Range: 'bytes=0-' }, signal });
+  return readBody(res, 'video/mp4', stream.size, onProgress);
+}
+
+/** Stops a half-written output so mediabunny releases its buffers. */
+async function cancelOutput(output: Output | null) {
+  if (output && output.state !== 'finalized' && output.state !== 'canceled') {
+    await output.cancel().catch(() => {});
   }
-  return new Blob(parts as BlobPart[], { type: 'video/mp4' });
-}
-
-function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-function safeFilename(title: string) {
-  return title.replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 150) || 'video';
 }

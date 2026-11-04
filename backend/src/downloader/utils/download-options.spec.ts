@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { BadRequestException } from '@nestjs/common';
-import { optionsSuffix, parseDownloadOptions, sectionArg } from './download-options.js';
+import { optionsSuffix, parseDownloadOptions } from './download-options.js';
 
 describe('parseDownloadOptions', () => {
   it('falls back to the configured format, and to mp4 for unsupported configs', () => {
@@ -39,7 +39,7 @@ describe('parseDownloadOptions', () => {
   });
 });
 
-describe('optionsSuffix / sectionArg', () => {
+describe('optionsSuffix', () => {
   it('keeps the bare key for the default download', () => {
     expect(optionsSuffix({ format: 'mp4' })).toBe('');
   });
@@ -47,10 +47,5 @@ describe('optionsSuffix / sectionArg', () => {
   it('encodes every variant', () => {
     expect(optionsSuffix({ format: 'mp4', height: 480, section: { start: 5, end: 9 } })).toBe('_480p_t5-9');
     expect(optionsSuffix({ format: 'mp3', section: { start: 5 } })).toBe('_mp3_t5-end');
-  });
-
-  it('builds yt-dlp section specs', () => {
-    expect(sectionArg({ start: 5, end: 9 })).toBe('*5-9');
-    expect(sectionArg({ start: 5 })).toBe('*5-inf');
   });
 });

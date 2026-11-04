@@ -63,9 +63,14 @@ export interface BackendSettings {
 export type DownloadStatus =
   | 'idle'
   | 'fetching_info'
-  | 'auto_downloading'
-  | 'browser_downloading'
+  // Info loaded, waiting for the user to pick options and press Download
+  | 'ready'
+  // The server is building the file (MP3, clips); no bytes yet
+  | 'preparing'
+  | 'downloading'
   | 'download_ready'
-  // MP3 and clips are built on the server first; the iframe download starts when it's done
-  | 'server_preparing'
+  | 'cancelled'
+  // A download failed; the card stays so the user can retry or change options
+  | 'download_failed'
+  // Loading the video info failed
   | 'error';

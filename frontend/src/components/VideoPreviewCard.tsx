@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Download, CheckCircle2, Clock, Loader2, RefreshCw, AlertCircle } from 'lucide-react';
+import { Download, CheckCircle2, Clock, Loader2, RefreshCw, AlertCircle, XCircle, Ban } from 'lucide-react';
 import { DEFAULT_SELECTION } from '../types/video';
 import type { VideoInfo, DownloadStatus, DownloadSelection } from '../types/video';
 import { DownloadOptions } from './DownloadOptions';
@@ -11,6 +11,7 @@ interface VideoPreviewCardProps {
   errorMessage: string | null;
   progress: number;
   onDownload: (selection: DownloadSelection) => void;
+  onCancel: () => void;
   onReset: () => void;
 }
 
@@ -20,6 +21,7 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
   errorMessage,
   progress,
   onDownload,
+  onCancel,
   onReset,
 }) => {
   const [selection, setSelection] = useState<DownloadSelection>(DEFAULT_SELECTION);
@@ -56,6 +58,7 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
   }
 
   if (!video) return null;
+  const busy = status === 'preparing' || status === 'downloading';
 
   return (
     <div className="card-container video-card">
@@ -93,54 +96,32 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
 
           <p className="video-author">By: {video.author}</p>
 
-          {/* Status banner */}
-          <div className="status-banner">
-            {status === 'browser_downloading' ? (
-              <div className="status-item downloading">
-                <Loader2 size={18} className="spinner icon-blue" />
-                <span>Downloading in your browser... {Math.round(progress * 100)}%</span>
-              </div>
-            ) : status === 'auto_downloading' ? (
-              <div className="status-item downloading">
-                <Loader2 size={18} className="spinner icon-blue" />
-                <span>Triggering your direct download automatically...</span>
-              </div>
-            ) : status === 'server_preparing' ? (
-              <div className="status-item downloading">
-                <Clock size={18} className="icon-blue" />
-                <span>
-                  Preparing your file on our server. It downloads automatically when ready, which
-                  can take a minute for MP3s and clips.
-                </span>
-              </div>
-            ) : (
-              <div className="status-item ready">
-                <CheckCircle2 size={18} className="icon-green" />
-                <span>
-                  Download triggered! If it didn't start automatically, click below.
-                </span>
-              </div>
-            )}
-          </div>
-
           <DownloadOptions
             video={video}
             selection={selection}
             onChange={setSelection}
             onValidityChange={setTrimValid}
-            disabled={status === 'browser_downloading'}
+            disabled={busy}
           />
 
-          {/* Direct Download Button */}
+          <StatusBanner status={status} progress={progress} errorMessage={errorMessage} />
+
           <div className="action-buttons">
-            <button
-              onClick={() => onDownload(selection)}
-              className="primary-download-button pulse-button"
-              disabled={status === 'browser_downloading' || !trimValid}
-            >
-              <Download size={20} />
-              <span>{downloadLabel(selection)}</span>
-            </button>
+            {busy ? (
+              <button onClick={onCancel} className="cancel-button">
+                <XCircle size={20} />
+                <span>Cancel download</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => onDownload(selection)}
+                className="primary-download-button"
+                disabled={!trimValid || status === 'fetching_info'}
+              >
+                <Download size={20} />
+                <span>{downloadLabel(selection)}</span>
+              </button>
+            )}
 
             <button onClick={onReset} className="link-button">
               Download another video
@@ -162,3 +143,73 @@ function downloadLabel(selection: DownloadSelection) {
     : '';
   return what + clip;
 }
+
+const StatusBanner: React.FC<{
+  status: DownloadStatus;
+  progress: number;
+  errorMessage: string | null;
+}> = ({ status, progress, errorMessage }) => {
+  if (status === 'preparing' || status === 'downloading') {
+    const preparing = status === 'preparing';
+    return (
+      <div className="status-banner info" role="status">
+        <div className="status-item downloading">
+          {preparing ? (
+            <Clock size={18} className="icon-blue" />
+          ) : (
+            <Loader2 size={18} className="spinner icon-blue" />
+          )}
+          <span>
+            {preparing
+              ? 'Preparing your file on our server. MP3s and clips can take a minute.'
+              : `Downloading... ${Math.round(progress * 100)}%`}
+          </span>
+        </div>
+        <div className={`progress-track${preparing ? ' indeterminate' : ''}`}>
+          <div className="progress-fill" style={preparing ? undefined : { width: `${progress * 100}%` }} />
+        </div>
+      </div>
+    );
+  }
+  if (status === 'fetching_info') {
+    return (
+      <div className="status-banner info" role="status">
+        <div className="status-item downloading">
+          <Loader2 size={18} className="spinner icon-blue" />
+          <span>Loading video info...</span>
+        </div>
+      </div>
+    );
+  }
+  if (status === 'download_ready') {
+    return (
+      <div className="status-banner" role="status">
+        <div className="status-item ready">
+          <CheckCircle2 size={18} className="icon-green" />
+          <span>Done! Check your downloads folder.</span>
+        </div>
+      </div>
+    );
+  }
+  if (status === 'cancelled') {
+    return (
+      <div className="status-banner neutral" role="status">
+        <div className="status-item muted">
+          <Ban size={18} />
+          <span>Download cancelled.</span>
+        </div>
+      </div>
+    );
+  }
+  if (status === 'download_failed') {
+    return (
+      <div className="status-banner error" role="alert">
+        <div className="status-item failed">
+          <AlertCircle size={18} />
+          <span>{errorMessage || 'Download failed. Please try again.'}</span>
+        </div>
+      </div>
+    );
+  }
+  return null;
+};

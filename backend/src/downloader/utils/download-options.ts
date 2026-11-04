@@ -56,11 +56,6 @@ export function optionsSuffix(options: DownloadOptions): string {
   return suffix;
 }
 
-/** yt-dlp --download-sections value, e.g. "*10-40" or "*10-inf". */
-export function sectionArg(section: NonNullable<DownloadOptions['section']>): string {
-  return `*${section.start}-${section.end ?? 'inf'}`;
-}
-
 function parseSeconds(value: string | undefined, name: string): number | undefined {
   if (value === undefined || value === '') return undefined;
   if (!/^\d{1,6}$/.test(value)) invalid(`Invalid ${name} time. Use whole seconds.`);

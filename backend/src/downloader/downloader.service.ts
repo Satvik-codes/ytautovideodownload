@@ -18,7 +18,7 @@ import {
 } from './dto/video-info.dto.js';
 import { WarpService } from './warp.service.js';
 import { StreamTokenPayload, StreamTokenSigner } from './utils/stream-token.js';
-import { DownloadOptions, optionsSuffix, sectionArg } from './utils/download-options.js';
+import { DownloadOptions, optionsSuffix } from './utils/download-options.js';
 
 export interface DownloadResult {
   filePath: string;
@@ -332,32 +332,45 @@ export class DownloaderService {
     this.logger.log(`Executing yt-dlp for ${fileKey}`);
     let expectedExt: string = targetExt;
     let aborted = false;
+    const killOnAbort = (child: ChildProcess) => {
+      registerAbort?.(() => {
+        aborted = true;
+        this.logger.warn(`Client aborted download for ${fileKey}. Terminating process.`);
+        child.kill('SIGTERM');
+        this.cleanupPartialFiles(fileKey);
+      });
+    };
 
+    // Clips download the full stream through the proxy and are cut here.
+    // yt-dlp's --download-sections was slower and unreliable: it hands the
+    // download to ffmpeg, which can't use the SOCKS (WARP) proxy, and in
+    // testing it dropped the video track of DASH formats
+    const stem = options.section ? `${fileKey}.src` : fileKey;
     const result = await this.runYtDlpWithRotation(
       target,
       (attempt) => {
-        const built = this.buildDownloadArgs(target, attempt, fileKey, options);
+        const built = this.buildDownloadArgs(target, attempt, stem, options);
         expectedExt = built.expectedExt;
         return built.args;
       },
-      (child) => {
-        registerAbort?.(() => {
-          aborted = true;
-          this.logger.warn(`Client aborted download for ${fileKey}. Terminating process.`);
-          child.kill('SIGTERM');
-          this.cleanupPartialFiles(fileKey);
-        });
-      },
+      killOnAbort,
       () => aborted,
     );
 
+    if (aborted) throw new BadRequestException('Download cancelled.');
     if (result.code !== 0) {
       this.logger.error(`Download process exited with code ${result.code}: ${result.stderr}`);
       this.cleanupPartialFiles(fileKey);
       throw new BadRequestException(`Download failed: ${this.firstErrorLine(result, target)}`);
     }
 
-    const candidateFile = path.join(this.storageDir, `${fileKey}.${expectedExt}`);
+    if (options.section) {
+      await this.cutSection(stem, finalFilePath, options, killOnAbort, () => aborted);
+    }
+
+    const candidateFile = options.section
+      ? finalFilePath
+      : path.join(this.storageDir, `${fileKey}.${expectedExt}`);
     if (!fs.existsSync(candidateFile)) {
       this.logger.error(`Expected file not found at ${candidateFile}`);
       throw new InternalServerErrorException('Downloaded file was not created properly.');
@@ -369,6 +382,61 @@ export class DownloaderService {
       ext: expectedExt,
       fileSize: fs.statSync(candidateFile).size,
     };
+  }
+
+  /**
+   * Cuts the clip out of the downloaded source with ffmpeg. Video is stream
+   * copied (cuts snap to the keyframe before the start); MP3 is encoded at
+   * 320 kbps; M4A copies AAC audio and only encodes other codecs.
+   */
+  private async cutSection(
+    stem: string,
+    destPath: string,
+    options: DownloadOptions,
+    onChild: (child: ChildProcess) => void,
+    isAborted: () => boolean,
+  ): Promise<void> {
+    const source = fs
+      .readdirSync(this.storageDir)
+      .find((file) => file.startsWith(`${stem}.`) && !/\.(part|ytdl)$/.test(file));
+    if (!source) {
+      throw new InternalServerErrorException('Downloaded file was not created properly.');
+    }
+    const sourcePath = path.join(this.storageDir, source);
+    const { start, end } = options.section!;
+
+    const codecArgs =
+      options.format === 'mp4'
+        ? ['-map', '0', '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart']
+        : options.format === 'mp3'
+          ? ['-vn', '-c:a', 'libmp3lame', '-b:a', '320k']
+          : ['-vn', '-c:a', /\.(m4a|mp4)$/.test(source) ? 'copy' : 'aac', '-b:a', '256k', '-movflags', '+faststart'];
+    const args = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-y',
+      '-ss',
+      String(start),
+      '-i',
+      sourcePath,
+      // -t, not -to: after an input seek the output timeline starts at zero
+      ...(end !== undefined ? ['-t', String(end - start)] : []),
+      ...codecArgs,
+      destPath,
+    ];
+
+    try {
+      const result = await this.runProcess('ffmpeg', args, onChild);
+      if (isAborted()) throw new BadRequestException('Download cancelled.');
+      if (result.code !== 0 || !fs.existsSync(destPath) || fs.statSync(destPath).size === 0) {
+        this.logger.error(`ffmpeg cut failed (${result.code}): ${result.stderr}`);
+        fs.rmSync(destPath, { force: true });
+        throw new InternalServerErrorException('Could not cut the clip.');
+      }
+    } finally {
+      fs.rmSync(sourcePath, { force: true });
+    }
   }
 
   /**
@@ -504,8 +572,16 @@ export class DownloaderService {
   }
 
   private runYtDlp(args: string[], onChild?: (child: ChildProcess) => void): Promise<YtDlpResult> {
+    return this.runProcess('yt-dlp', args, onChild);
+  }
+
+  private runProcess(
+    command: string,
+    args: string[],
+    onChild?: (child: ChildProcess) => void,
+  ): Promise<YtDlpResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn('yt-dlp', args, { shell: false });
+      const child = spawn(command, args, { shell: false });
       let stdout = '';
       let stderr = '';
       onChild?.(child);
@@ -513,7 +589,7 @@ export class DownloaderService {
       child.stdout.on('data', (chunk) => (stdout += chunk.toString()));
       child.stderr.on('data', (chunk) => (stderr += chunk.toString()));
       child.on('error', (err) => {
-        this.logger.error(`Failed to spawn yt-dlp: ${err.message}`);
+        this.logger.error(`Failed to spawn ${command}: ${err.message}`);
         reject(new InternalServerErrorException('Failed to execute downloader engine on server.'));
       });
       child.on('close', (code) => resolve({ code, stdout, stderr }));
@@ -552,17 +628,20 @@ export class DownloaderService {
   private buildDownloadArgs(
     target: MediaTarget,
     attempt: Attempt,
-    fileKey: string,
+    stem: string,
     options: DownloadOptions,
   ): { args: string[]; expectedExt: string } {
     const normalizedUrl = target.normalizedUrl;
-    const baseArgs = [
-      ...this.getBaseYtDlpArgs(target, attempt),
-      // ffmpeg cuts clips with stream copy, so video cuts snap to the nearest
-      // keyframe; frame-accurate cuts would mean re-encoding on the server
-      ...(options.section ? ['--download-sections', sectionArg(options.section)] : []),
-    ];
-    const outputTemplate = path.join(this.storageDir, `${fileKey}.%(ext)s`);
+    const baseArgs = this.getBaseYtDlpArgs(target, attempt);
+    const outputTemplate = path.join(this.storageDir, `${stem}.%(ext)s`);
+
+    // Audio clips: fetch the source audio as is; cutSection converts it
+    if (options.section && options.format !== 'mp4') {
+      return {
+        args: [...baseArgs, '-f', 'ba[ext=m4a]/ba', '-o', outputTemplate, '--', normalizedUrl],
+        expectedExt: 'm4a',
+      };
+    }
 
     if (options.format === 'mp3') {
       return {

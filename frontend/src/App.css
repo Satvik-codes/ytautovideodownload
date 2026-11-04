@@ -151,6 +151,8 @@
 
 .search-input {
   flex: 1;
+  /* Inputs default to an intrinsic min width, which pushed the buttons off small screens */
+  min-width: 0;
   border: none;
   outline: none;
   font-size: 1rem;
@@ -347,6 +349,81 @@
 
 .status-item.ready {
   color: #166534;
+}
+
+.status-banner.info {
+  background-color: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.status-banner.neutral {
+  background-color: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.status-banner.error {
+  background-color: #fef2f2;
+  border-color: #fecaca;
+}
+
+.status-item.muted {
+  color: #475569;
+}
+
+.status-item.failed {
+  color: #b91c1c;
+}
+
+.progress-track {
+  position: relative;
+  height: 6px;
+  margin-top: 0.6rem;
+  border-radius: 999px;
+  background-color: #dbeafe;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background-color: #2563eb;
+  transition: width 0.2s ease;
+}
+
+/* The server gives no progress while it prepares the file */
+.progress-track.indeterminate .progress-fill {
+  position: absolute;
+  width: 35%;
+  animation: progressSlide 1.2s ease-in-out infinite;
+}
+
+@keyframes progressSlide {
+  from {
+    left: -35%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+.cancel-button {
+  background-color: #ffffff;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  padding: 0.85rem 1.6rem;
+  border-radius: 12px;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  transition: background-color 0.15s;
+}
+
+.cancel-button:hover {
+  background-color: #fef2f2;
 }
 
 .icon-blue {

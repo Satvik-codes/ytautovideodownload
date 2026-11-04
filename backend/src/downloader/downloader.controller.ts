@@ -160,6 +160,8 @@ export class DownloaderController {
       fileStream.pipe(res);
     } catch (error) {
       isFinished = true;
+      // The client cancelled; the abort handler already logged it
+      if (res.destroyed) return;
       const msg = error instanceof Error ? error.message : String(error);
       this.logger.error(`Download endpoint error: ${msg}`);
       if (!res.headersSent) {

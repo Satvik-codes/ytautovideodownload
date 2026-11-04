@@ -56,7 +56,7 @@ export const UrlInput: React.FC<UrlInputProps> = ({ onSearch, isLoading }) => {
           className="submit-button"
           disabled={isLoading || !value.trim()}
         >
-          <span>{isLoading ? 'Processing...' : 'Download'}</span>
+          <span>{isLoading ? 'Loading...' : 'Get video'}</span>
           <ArrowRight size={18} />
         </button>
       </form>
