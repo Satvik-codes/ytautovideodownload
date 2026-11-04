@@ -14,6 +14,8 @@ import { DownloaderService, USER_AGENT } from './downloader.service.js';
 import { sanitizeFilename } from './utils/filename-sanitizer.js';
 import { parseClampedRange, relayRange } from './utils/stream-relay.js';
 import { VideoInfoResponse, BackendSettingsResponse } from './dto/video-info.dto.js';
+import { parseDownloadOptions } from './utils/download-options.js';
+import type { DownloadQuery } from './utils/download-options.js';
 
 @Controller('api/video')
 export class DownloaderController {
@@ -81,16 +83,23 @@ export class DownloaderController {
     }
   }
 
+  /**
+   * Server-side download, used for MP3, trimmed clips, and as the fallback
+   * when in-browser download fails. Optional ?format=mp4|mp3|m4a,
+   * ?quality=720p and ?start=/?end= (whole seconds) pick the variant.
+   */
   @Get('download')
   async downloadVideo(
     @Query('v') v?: string,
     @Query('url') url?: string,
+    @Query() query: DownloadQuery = {},
     @Res() res?: Response,
   ): Promise<void> {
     const input = v || url;
     if (!input) {
       throw new BadRequestException('A video ID (?v=...) or URL (?url=...) is required.');
     }
+    const options = parseDownloadOptions(query, this.downloaderService.getSettings().format);
 
     if (!res) {
       throw new BadRequestException('Response object is unavailable.');
@@ -110,6 +119,7 @@ export class DownloaderController {
     try {
       const result = await this.downloaderService.downloadVideo(
         input,
+        options,
         (abortFn) => {
           abortCallback = abortFn;
         },

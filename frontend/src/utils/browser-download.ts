@@ -105,14 +105,16 @@ const openInput = (stream: StreamDescriptor) =>
  */
 export async function downloadInBrowser(
   video: VideoInfo,
+  height: number | undefined,
   onProgress: (fraction: number) => void,
 ): Promise<void> {
   const streams = video.streams;
   if (!streams) throw new Error('No browser-downloadable streams.');
 
+  const videoStream = streams.videos?.find((s) => s.height === height) ?? streams.video;
   const blob =
-    streams.video && streams.audio
-      ? await muxStreams(streams.video, streams.audio, video.duration, onProgress)
+    videoStream && streams.audio
+      ? await muxStreams(videoStream, streams.audio, video.duration, onProgress)
       : streams.progressive
         ? await fetchWhole(streams.progressive, onProgress)
         : null;
@@ -129,9 +131,10 @@ export async function downloadInBrowser(
  */
 export async function downloadDirect(
   video: VideoInfo,
+  height: number | undefined,
   onProgress: (fraction: number) => void,
 ): Promise<void> {
-  const stream = video.streams?.direct;
+  const stream = video.streams?.directs?.find((s) => s.height === height) ?? video.streams?.direct;
   if (!stream) throw new Error('No direct stream.');
 
   // video.twimg.com rejects requests whose Referer is another site (hotlink
@@ -157,6 +160,38 @@ export async function downloadDirect(
 
   saveBlob(new Blob(parts as BlobPart[], { type: 'video/mp4' }), `${safeFilename(video.title)}.mp4`);
   onProgress(1);
+}
+
+/**
+ * M4A without server work: the AAC stream comes through the relay and its
+ * packets are repackaged into a plain (non-fragmented) M4A, no re-encoding.
+ */
+export async function downloadAudioInBrowser(
+  video: VideoInfo,
+  onProgress: (fraction: number) => void,
+): Promise<void> {
+  const stream = video.streams?.audio;
+  if (!stream) throw new Error('No browser-downloadable audio stream.');
+
+  const input = openInput(stream);
+  try {
+    const track = await input.getPrimaryAudioTrack();
+    if (!track?.codec) throw new Error('Unsupported audio codec.');
+
+    const target = new BufferTarget();
+    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+    const source = new EncodedAudioPacketSource(track.codec);
+    output.addAudioTrack(source);
+    await output.start();
+    await copyPackets(track, source, (t) => video.duration > 0 && onProgress(Math.min(t / video.duration, 0.99)));
+    await output.finalize();
+
+    if (!target.buffer) throw new Error('Packaging produced no output.');
+    saveBlob(new Blob([target.buffer], { type: 'audio/mp4' }), `${safeFilename(video.title)}.m4a`);
+    onProgress(1);
+  } finally {
+    input.dispose();
+  }
 }
 
 async function muxStreams(

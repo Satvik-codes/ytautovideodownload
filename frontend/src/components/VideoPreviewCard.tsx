@@ -1,13 +1,16 @@
-import React from 'react';
-import { Download, CheckCircle2, Loader2, RefreshCw, AlertCircle } from 'lucide-react';
-import type { VideoInfo, DownloadStatus } from '../types/video';
+import React, { useState } from 'react';
+import { Download, CheckCircle2, Clock, Loader2, RefreshCw, AlertCircle } from 'lucide-react';
+import { DEFAULT_SELECTION } from '../types/video';
+import type { VideoInfo, DownloadStatus, DownloadSelection } from '../types/video';
+import { DownloadOptions } from './DownloadOptions';
+import { formatClock } from '../utils/clock';
 
 interface VideoPreviewCardProps {
   video: VideoInfo | null;
   status: DownloadStatus;
   errorMessage: string | null;
   progress: number;
-  onManualDownload: () => void;
+  onDownload: (selection: DownloadSelection) => void;
   onReset: () => void;
 }
 
@@ -16,9 +19,12 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
   status,
   errorMessage,
   progress,
-  onManualDownload,
+  onDownload,
   onReset,
 }) => {
+  const [selection, setSelection] = useState<DownloadSelection>(DEFAULT_SELECTION);
+  const [trimValid, setTrimValid] = useState(true);
+
   if (status === 'error') {
     return (
       <div className="card-container error-card">
@@ -74,12 +80,6 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
             <span className="badge-pill format-pill">
               {video.platform === 'twitter' ? 'X' : 'YouTube'}
             </span>
-            <span className="badge-pill format-pill">
-              {video.format.toUpperCase()}
-            </span>
-            <span className="badge-pill quality-pill">
-              Quality: {video.quality}
-            </span>
             {video.views && (
               <span className="badge-pill views-pill">
                 {Number(video.views).toLocaleString()} views
@@ -105,6 +105,14 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
                 <Loader2 size={18} className="spinner icon-blue" />
                 <span>Triggering your direct download automatically...</span>
               </div>
+            ) : status === 'server_preparing' ? (
+              <div className="status-item downloading">
+                <Clock size={18} className="icon-blue" />
+                <span>
+                  Preparing your file on our server. It downloads automatically when ready, which
+                  can take a minute for MP3s and clips.
+                </span>
+              </div>
             ) : (
               <div className="status-item ready">
                 <CheckCircle2 size={18} className="icon-green" />
@@ -115,17 +123,23 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
             )}
           </div>
 
+          <DownloadOptions
+            video={video}
+            selection={selection}
+            onChange={setSelection}
+            onValidityChange={setTrimValid}
+            disabled={status === 'browser_downloading'}
+          />
+
           {/* Direct Download Button */}
           <div className="action-buttons">
             <button
-              onClick={onManualDownload}
+              onClick={() => onDownload(selection)}
               className="primary-download-button pulse-button"
-              disabled={status === 'browser_downloading'}
+              disabled={status === 'browser_downloading' || !trimValid}
             >
               <Download size={20} />
-              <span>
-                Download Video ({video.format.toUpperCase()} • {video.quality})
-              </span>
+              <span>{downloadLabel(selection)}</span>
             </button>
 
             <button onClick={onReset} className="link-button">
@@ -137,3 +151,14 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
     </div>
   );
 };
+
+function downloadLabel(selection: DownloadSelection) {
+  const what =
+    selection.kind === 'audio'
+      ? `Download Audio (${selection.audioFormat === 'mp3' ? 'MP3 • 320 kbps' : 'M4A'})`
+      : `Download Video (MP4 • ${selection.height ? `${selection.height}p` : 'Best'})`;
+  const clip = selection.trim
+    ? ` • ${formatClock(selection.trim.start)}–${formatClock(selection.trim.end)}`
+    : '';
+  return what + clip;
+}

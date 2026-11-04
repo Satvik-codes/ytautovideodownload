@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { Header } from './components/Header';
 import { UrlInput } from './components/UrlInput';
 import { VideoPreviewCard } from './components/VideoPreviewCard';
-import type { VideoInfo, DownloadStatus } from './types/video';
+import { DEFAULT_SELECTION } from './types/video';
+import type { VideoInfo, DownloadStatus, DownloadSelection } from './types/video';
 import { parseMediaInput, detectMediaFromCurrentWindow } from './utils/media-parser';
 import type { MediaRef } from './utils/media-parser';
 import { getApiUrl } from './config/api';
@@ -25,9 +26,20 @@ export function App() {
     }
   }, []);
 
-  const triggerBrowserDownload = (videoData: VideoInfo) => {
+  const triggerBrowserDownload = (videoData: VideoInfo, selection: DownloadSelection) => {
     // The server builds the right fallback URL per platform (?v= or ?url=)
-    const downloadEndpoint = getApiUrl(videoData.downloadUrl);
+    const params = new URLSearchParams();
+    if (selection.kind === 'audio') {
+      params.set('format', selection.audioFormat);
+    } else {
+      params.set('format', 'mp4');
+      if (selection.height) params.set('quality', `${selection.height}p`);
+    }
+    if (selection.trim) {
+      params.set('start', String(selection.trim.start));
+      params.set('end', String(selection.trim.end));
+    }
+    const downloadEndpoint = getApiUrl(`${videoData.downloadUrl}&${params}`);
 
     // Trigger download via hidden iframe
     if (iframeRef.current) {
@@ -45,23 +57,31 @@ export function App() {
 
   // Preferred path: X files come straight from X's CDN; YouTube streams come
   // through the relay in small chunks and are muxed in the browser. Either
-  // way, failures fall back to the server-side download endpoint.
-  const startDownload = async (videoData: VideoInfo) => {
-    if (videoData.streams) {
+  // way, failures fall back to the server-side download endpoint. MP3 and
+  // clips always go to the server: they need ffmpeg (encoding / cutting).
+  const startDownload = async (videoData: VideoInfo, selection: DownloadSelection) => {
+    const audioInBrowser =
+      selection.kind === 'audio' && selection.audioFormat === 'm4a' && !!videoData.streams?.audio;
+    const inBrowser = !selection.trim && (selection.kind === 'video' || audioInBrowser);
+
+    if (videoData.streams && inBrowser) {
       setStatus('browser_downloading');
       setProgress(0);
       try {
         // Loaded on demand: the muxer is only needed once a download starts
-        const { downloadInBrowser, downloadDirect, StreamExpiredError } = await import(
-          './utils/browser-download'
-        );
+        const { downloadInBrowser, downloadDirect, downloadAudioInBrowser, StreamExpiredError } =
+          await import('./utils/browser-download');
         if (videoData.streams.direct) {
-          await downloadDirect(videoData, setProgress);
+          await downloadDirect(videoData, selection.height, setProgress);
           setStatus('download_ready');
           return;
         }
+        const run = (data: VideoInfo) =>
+          audioInBrowser
+            ? downloadAudioInBrowser(data, setProgress)
+            : downloadInBrowser(data, selection.height, setProgress);
         try {
-          await downloadInBrowser(videoData, setProgress);
+          await run(videoData);
         } catch (err) {
           // Links die when the server's egress IP rotates; the server has
           // already dropped its cache, so fresh info yields working links
@@ -70,8 +90,9 @@ export function App() {
           if (!fresh.ok) throw err;
           const freshData: VideoInfo = await fresh.json();
           if (!freshData.streams) throw err;
+          setVideo(freshData);
           setProgress(0);
-          await downloadInBrowser(freshData, setProgress);
+          await run(freshData);
         }
         setStatus('download_ready');
         return;
@@ -81,11 +102,13 @@ export function App() {
     }
 
     setStatus('auto_downloading');
-    triggerBrowserDownload(videoData);
+    triggerBrowserDownload(videoData, selection);
 
-    // Update status after short timeout to acknowledge browser trigger
+    // Update status after short timeout to acknowledge browser trigger. The
+    // iframe gives no completion signal, so slow server jobs say so instead
+    const slowJob = !!selection.trim || (selection.kind === 'audio' && !audioInBrowser);
     setTimeout(() => {
-      setStatus('download_ready');
+      setStatus(slowJob ? 'server_preparing' : 'download_ready');
     }, 1500);
   };
 
@@ -102,7 +125,7 @@ export function App() {
 
       const videoData: VideoInfo = await response.json();
       setVideo(videoData);
-      await startDownload(videoData);
+      await startDownload(videoData, DEFAULT_SELECTION);
     } catch (err) {
       setStatus('error');
       setErrorMessage(err instanceof Error ? err.message : 'Failed to process video.');
@@ -167,11 +190,13 @@ export function App() {
         {/* Video preview / download card when a video is loaded */}
         {(video || status === 'fetching_info' || status === 'error') && (
           <VideoPreviewCard
+            // Fresh picker state (trim bounds especially) for every video
+            key={video?.id}
             video={video}
             status={status}
             errorMessage={errorMessage}
             progress={progress}
-            onManualDownload={() => video && startDownload(video)}
+            onDownload={(selection) => video && startDownload(video, selection)}
             onReset={handleReset}
           />
         )}

@@ -30,10 +30,15 @@ export class DirectStream {
 }
 
 export class VideoStreams {
+  /** Default video pick (best within the quality cap), muxed with `audio` */
   video?: StreamDescriptor;
+  /** Every video-only quality, one per height, best first; each pairs with `audio` */
+  videos?: StreamDescriptor[];
   audio?: StreamDescriptor;
   progressive?: StreamDescriptor;
   direct?: DirectStream;
+  /** Every X CDN quality, one per height, best first */
+  directs?: DirectStream[];
 }
 
 export class BackendSettingsResponse {

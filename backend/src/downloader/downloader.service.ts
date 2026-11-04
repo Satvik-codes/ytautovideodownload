@@ -18,6 +18,7 @@ import {
 } from './dto/video-info.dto.js';
 import { WarpService } from './warp.service.js';
 import { StreamTokenPayload, StreamTokenSigner } from './utils/stream-token.js';
+import { DownloadOptions, optionsSuffix, sectionArg } from './utils/download-options.js';
 
 export interface DownloadResult {
   filePath: string;
@@ -57,6 +58,9 @@ export const USER_AGENT =
 // Tried in order. The embedded-player client is checked less strictly on
 // datacenter IPs and needs one request; mweb/tv cover non-embeddable videos.
 const DEFAULT_CLIENT_CHAIN = ['web_embedded', 'mweb,tv'];
+
+// Smallest quality offered in the picker
+const MIN_HEIGHT = 360;
 
 // stderr patterns that mean YouTube is blocking our egress IP
 const BLOCKED_PATTERNS = [
@@ -297,18 +301,25 @@ export class DownloaderService {
 
   async downloadVideo(
     input: string,
+    options: DownloadOptions,
     registerAbort?: (abortFn: () => void) => void,
   ): Promise<DownloadResult> {
     const target = parseMediaTarget(input);
     const key = target.storageKey;
-    const targetExt = this.defaultFormat === 'mp3' ? 'mp3' : 'mp4';
-    const finalFilePath = path.join(this.storageDir, `${key}.${targetExt}`);
+    const duration = this.infoCache.get(key)?.info.duration;
+    if (options.section && duration && options.section.start >= duration) {
+      throw new BadRequestException('The clip start is past the end of the video.');
+    }
+    // Every variant (format, quality, clip) gets its own file
+    const fileKey = `${key}${optionsSuffix(options)}`;
+    const targetExt = options.format;
+    const finalFilePath = path.join(this.storageDir, `${fileKey}.${targetExt}`);
 
     // If already downloaded and cached, return immediately
     if (fs.existsSync(finalFilePath)) {
       const stats = fs.statSync(finalFilePath);
       if (stats.size > 0) {
-        this.logger.log(`Serving cached video for ${key} (${stats.size} bytes)`);
+        this.logger.log(`Serving cached file ${fileKey} (${stats.size} bytes)`);
         return {
           filePath: finalFilePath,
           title: this.cachedTitle(key),
@@ -318,23 +329,23 @@ export class DownloaderService {
       }
     }
 
-    this.logger.log(`Executing yt-dlp for ${key}`);
-    let expectedExt = targetExt;
+    this.logger.log(`Executing yt-dlp for ${fileKey}`);
+    let expectedExt: string = targetExt;
     let aborted = false;
 
     const result = await this.runYtDlpWithRotation(
       target,
       (attempt) => {
-        const built = this.buildDownloadArgs(target, attempt);
+        const built = this.buildDownloadArgs(target, attempt, fileKey, options);
         expectedExt = built.expectedExt;
         return built.args;
       },
       (child) => {
         registerAbort?.(() => {
           aborted = true;
-          this.logger.warn(`Client aborted download for ${key}. Terminating process.`);
+          this.logger.warn(`Client aborted download for ${fileKey}. Terminating process.`);
           child.kill('SIGTERM');
-          this.cleanupPartialFiles(key);
+          this.cleanupPartialFiles(fileKey);
         });
       },
       () => aborted,
@@ -342,11 +353,11 @@ export class DownloaderService {
 
     if (result.code !== 0) {
       this.logger.error(`Download process exited with code ${result.code}: ${result.stderr}`);
-      this.cleanupPartialFiles(key);
+      this.cleanupPartialFiles(fileKey);
       throw new BadRequestException(`Download failed: ${this.firstErrorLine(result, target)}`);
     }
 
-    const candidateFile = path.join(this.storageDir, `${key}.${expectedExt}`);
+    const candidateFile = path.join(this.storageDir, `${fileKey}.${expectedExt}`);
     if (!fs.existsSync(candidateFile)) {
       this.logger.error(`Expected file not found at ${candidateFile}`);
       throw new InternalServerErrorException('Downloaded file was not created properly.');
@@ -419,23 +430,23 @@ export class DownloaderService {
     });
     const byHeight = (a: any, b: any) =>
       (b.height || 0) - (a.height || 0) || (b.tbr || 0) - (a.tbr || 0);
-    const best =
-      candidates.filter((f) => (f.height || 0) <= maxHeight).sort(byHeight)[0] ??
-      candidates.sort(byHeight).at(-1);
+    const ladder = onePerHeight(candidates.filter((f) => (f.height || 0) <= maxHeight).sort(byHeight));
+    const best = ladder[0] ?? candidates.sort(byHeight).at(-1);
     if (!best) return undefined;
 
-    const direct: DirectStream = {
-      url: best.url,
-      height: best.height || undefined,
-      size: best.filesize || best.filesize_approx || undefined,
+    const describe = (f: any): DirectStream => ({
+      url: f.url,
+      height: f.height || undefined,
+      size: f.filesize || f.filesize_approx || undefined,
       ext: 'mp4',
-    };
-    return { direct };
+    });
+    return { direct: describe(best), directs: ladder.length ? ladder.map(describe) : [describe(best)] };
   }
 
   /**
-   * Picks the streams the browser relays and muxes itself: best H.264 video
-   * within the quality cap, best AAC audio, and a progressive (single-file)
+   * Picks the streams the browser relays and muxes itself: the best H.264
+   * video per height within the quality cap (the quality picker's options),
+   * best AAC audio (also the in-browser M4A), and a progressive (single-file)
    * fallback. Only direct https formats qualify (no HLS/DASH manifests).
    */
   private selectStreams(videoId: string, formats: any[] | undefined): VideoStreams | undefined {
@@ -446,15 +457,20 @@ export class DownloaderService {
     const byQuality = (a: any, b: any) =>
       (b.height || 0) - (a.height || 0) || (b.tbr || 0) - (a.tbr || 0);
 
-    const video = direct
-      .filter(
-        (f) =>
-          String(f.vcodec).startsWith('avc1') &&
-          f.acodec === 'none' &&
-          f.ext === 'mp4' &&
-          (f.height || 0) <= maxHeight,
-      )
-      .sort(byQuality)[0];
+    const videos = onePerHeight(
+      direct
+        .filter(
+          (f) =>
+            String(f.vcodec).startsWith('avc1') &&
+            f.acodec === 'none' &&
+            f.ext === 'mp4' &&
+            (f.height || 0) <= maxHeight,
+        )
+        .sort(byQuality),
+    );
+    // Renditions below 360p only as a last resort, so the picker stays useful
+    const offered = videos.filter((f) => (f.height || 0) >= MIN_HEIGHT);
+    const ladder = offered.length ? offered : videos.slice(0, 1);
     const audio = direct
       .filter((f) => String(f.acodec).startsWith('mp4a') && f.vcodec === 'none' && f.ext === 'm4a')
       .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
@@ -476,10 +492,13 @@ export class DownloaderService {
       };
     };
 
-    if (!(video && audio) && !progressive) return undefined;
+    if (!(ladder.length && audio) && !progressive && !audio) return undefined;
+    // Video-only streams are useless without audio to mux them with
+    const muxable = audio ? ladder.map((f) => describe(f)!) : [];
     return {
-      video: video && audio ? describe(video) : undefined,
-      audio: video && audio ? describe(audio) : undefined,
+      video: muxable[0],
+      videos: muxable.length ? muxable : undefined,
+      audio: describe(audio),
       progressive: describe(progressive),
     };
   }
@@ -533,12 +552,19 @@ export class DownloaderService {
   private buildDownloadArgs(
     target: MediaTarget,
     attempt: Attempt,
+    fileKey: string,
+    options: DownloadOptions,
   ): { args: string[]; expectedExt: string } {
     const normalizedUrl = target.normalizedUrl;
-    const baseArgs = this.getBaseYtDlpArgs(target, attempt);
-    const outputTemplate = path.join(this.storageDir, `${target.storageKey}.%(ext)s`);
+    const baseArgs = [
+      ...this.getBaseYtDlpArgs(target, attempt),
+      // ffmpeg cuts clips with stream copy, so video cuts snap to the nearest
+      // keyframe; frame-accurate cuts would mean re-encoding on the server
+      ...(options.section ? ['--download-sections', sectionArg(options.section)] : []),
+    ];
+    const outputTemplate = path.join(this.storageDir, `${fileKey}.%(ext)s`);
 
-    if (this.defaultFormat === 'mp3') {
+    if (options.format === 'mp3') {
       return {
         args: [
           ...baseArgs,
@@ -546,7 +572,7 @@ export class DownloaderService {
           '--audio-format',
           'mp3',
           '--audio-quality',
-          '0',
+          '320K',
           '-o',
           outputTemplate,
           '--',
@@ -556,7 +582,7 @@ export class DownloaderService {
       };
     }
 
-    if (this.defaultFormat === 'm4a') {
+    if (options.format === 'm4a') {
       return {
         args: [
           ...baseArgs,
@@ -575,8 +601,11 @@ export class DownloaderService {
     // MP4 video format selector based on configured quality. H.264 (avc1) is
     // preferred: YouTube also ships AV1 in MP4, which many players (including
     // Windows' built-in ones) can't play without an extra codec
-    const caps: Record<string, string> = { '1080p': '1080', '720p': '720', '480p': '480' };
-    const h = caps[this.defaultQuality] ? `[height<=${caps[this.defaultQuality]}]` : '';
+    // A requested height never exceeds the configured cap
+    const caps: Record<string, number> = { '1080p': 1080, '720p': 720, '480p': 480 };
+    const cap = caps[this.defaultQuality];
+    const height = options.height && cap ? Math.min(options.height, cap) : options.height || cap;
+    const h = height ? `[height<=${height}]` : '';
     // X ships single-file H.264 MP4s over https; prefer those over its HLS variants
     const formatSelector = (
       target.platform === 'twitter'
@@ -633,4 +662,15 @@ export class DownloaderService {
     }
     return `${mins}:${formattedSecs}`;
   }
+}
+
+/** Keeps the first (best) format of each height from a list sorted best first. */
+function onePerHeight(sorted: any[]): any[] {
+  const seen = new Set<number>();
+  return sorted.filter((f) => {
+    const height = f.height || 0;
+    if (seen.has(height)) return false;
+    seen.add(height);
+    return true;
+  });
 }

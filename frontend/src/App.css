@@ -401,6 +401,187 @@
   color: #0f172a;
 }
 
+/* Download Options (format tabs, quality, audio format, trim) */
+.options-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 1rem;
+  background-color: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+}
+
+.options-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  background-color: #e2e8f0;
+  border-radius: 10px;
+}
+
+.options-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #475569;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.options-tab:hover:not(:disabled) {
+  color: #0f172a;
+}
+
+.options-tab.active {
+  background-color: #ffffff;
+  color: #1d4ed8;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+}
+
+.options-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.options-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #64748b;
+}
+
+.options-select,
+.options-input {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background-color: #ffffff;
+  color: #0f172a;
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+
+.options-select:focus,
+.options-input:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+.options-input[aria-invalid='true'] {
+  border-color: #dc2626;
+}
+
+.format-choices {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+@media (max-width: 480px) {
+  .format-choices {
+    grid-template-columns: 1fr;
+  }
+}
+
+.format-choice {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background-color: #ffffff;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.format-choice input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.format-choice:focus-within {
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+.format-choice.active {
+  border-color: #2563eb;
+  background-color: #eff6ff;
+}
+
+.format-choice-title {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.format-choice-hint {
+  font-size: 0.78rem;
+  color: #64748b;
+}
+
+.trim-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.trim-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #334155;
+  cursor: pointer;
+  width: fit-content;
+}
+
+.trim-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: #2563eb;
+}
+
+.trim-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.trim-hint {
+  grid-column: 1 / -1;
+  font-size: 0.8rem;
+  color: #64748b;
+}
+
+.trim-hint.error {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+.primary-download-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+  animation: none;
+}
+
 /* Loading & Error Cards */
 .loading-card,
 .error-card {
