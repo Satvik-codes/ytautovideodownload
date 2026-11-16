@@ -1,6 +1,6 @@
 # YouDown on Render Free: Cloudflare WARP egress + scale patterns
 
-> Saved 2026-10-28 for future reference. Status: **plan only, nothing implemented yet.**
+> Saved 2026-10-28. Status: Steps 1, 3, 4, 5 and 6 are implemented (WARP egress, rotation, relay + browser muxing, info cache, `/api/health`). Step 2's PO-token provider is **not** built. **Read "IPv6 bot wall (2026-11-16)" at the end first:** WARP must run IPv4-only.
 
 ## Context
 YouTube blocks Render's datacenter IPs ("Sign in to confirm you're not a bot"). Cookies and paid proxies are ruled out, so the chosen egress is **Cloudflare WARP** (free forever, via `wgcf` + `wireproxy`). The plan also borrows patterns from existing downloader sites that fit Render free: 512 MB RAM, 100 s request timeout, sleeps after 15 min idle.
@@ -95,3 +95,38 @@ YouTube blocks Render's datacenter IPs ("Sign in to confirm you're not a bot"). 
 ## Tooling notes
 - REA: `npx -y rea-agents@6.8.0 analyze-web-bundle <cdp-endpoint> <targetId> --format json`. Needs Chrome launched with `--remote-debugging-port`. It warns about Node engine `^22.23.4 || ^24.22.1` (local is 24.14.0) but ran fine.
 - To use REA as an MCP server inside Claude Code: `npx rea-agents setup` (interactive), then restart.
+
+---
+
+## IPv6 bot wall (2026-11-16): WARP runs IPv4-only
+
+**Symptom:** users got `Sign in to confirm you're not a bot` for almost every YouTube video on https://youdown-yb6f.onrender.com.
+
+**Cause:** the tunnel was dual-stack, so YouTube saw WARP's **IPv6** egress (decoded stream tokens carried `ip=2a09:bac5:...`).
+- Each WARP account gets its own IPv6 address inside a few Cloudflare ranges (`2a09:bac0::/29`) that downloaders abuse, and YouTube flags those ranges.
+- Rotation (`WarpService.rotate()`) can't help: a new account is just another address in the same range.
+- WARP's **IPv4** egress (`104.28.x.x`) is shared with very many consumer devices, so YouTube doesn't block it.
+
+**Fix (commit `e9be1c8`):** `WarpService` rewrites the wgcf profile to IPv4 only before starting wireproxy (`utils/warp-profile.ts`).
+- `WARP_IP_FAMILY=ipv4` is the default; `dual` reverts to the old behaviour.
+- `/api/health` reports `warp.ipFamily`.
+- The relay needed no change: `utils/stream-relay.ts` already pins the address family from each URL's `ip=`.
+
+**Evidence (live site, same video list):**
+
+| | Egress | Result |
+|---|---|---|
+| Before | `2a09:bac5:...` (IPv6), 6 rotations | 19/20 bot wall; the one success was a cached answer |
+| After | `104.28.201.162` (IPv4), 0 rotations | 12/13 OK (sweep stopped early). The miss was a 502 on the first request after deploy; the same video then loaded and downloaded (MP4 + MP3) in the browser |
+
+**UX:** bot-wall failures now return `503 {code: "YT_BLOCKED"}` with "YouTube is temporarily blocking our server. Please try again in a minute." instead of yt-dlp's cookie advice. The error card shows **Try again** only for that code.
+
+**Rejected again:**
+- Cookies and paid/residential proxies (unchanged decision).
+- A local A/B spike was not possible: the dev network blocks WARP's UDP on ports 2408, 500, 1701 and 4500. The comparison ran on Render itself.
+
+**Open issue: slow extraction.**
+- `/api/video/info` takes about 30 s per new video over WARP, and 68 s for one Short.
+- A full-length server MP3 took 106 s.
+- That is close to Render's 100 s request limit. Next candidates: find which client in the chain actually succeeds and try it first; add the PO-token provider (Step 2) if YouTube starts walling IPv4 too.
+

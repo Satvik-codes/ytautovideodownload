@@ -1,10 +1,7 @@
 # Deploying YouDown on Render (Single Unified Deployment)
 
-> [!WARNING]
-> **Read Before Deploying to Render**:
-> YouTube strictly blacklists IP addresses belonging to datacenter hosting providers (Render, AWS, DigitalOcean, etc.). Deploying YouDown directly to Render on the Free Tier **will fail** with `429 Too Many Requests` or `Sign in to confirm you're not a bot` unless you configure a **Residential Proxy** or provide **YouTube Cookies**.
->
-> Please read the [Limitations & Roadblocks on Render](#-limitations--roadblocks-on-render) section below before deploying.
+> [!NOTE]
+> YouTube blocks datacenter IPs like Render's (`Sign in to confirm you're not a bot`). YouDown handles this itself: the image routes YouTube traffic through a free **Cloudflare WARP** tunnel over **IPv4** (see the WARP section below). No proxy or cookies are needed.
 
 ---
 
@@ -15,7 +12,7 @@ YouTube systematically blocks video downloads from cloud hosting data centers:
 - `HTTP Error 429: Too Many Requests`
 - Bot challenge pages (`Sign in to confirm you’re not a bot`)
 - Missing stream formats / PO Token required error
-Render routes all outgoing container traffic through its shared datacenter IPs, which YouTube aggressively flags.
+Render routes all outgoing container traffic through its shared datacenter IPs, which YouTube aggressively flags. YouDown avoids this with its built-in WARP tunnel. WARP's IPv6 addresses are flagged too, which is why the tunnel runs IPv4-only.
 
 ### 2. Free Tier Resource Limits
 - **512 MB RAM**: Video downloading and muxing with `ffmpeg` + `yt-dlp` can quickly spike memory beyond 512 MB, triggering Linux OOM (Out Of Memory) kills.
@@ -25,16 +22,17 @@ Render routes all outgoing container traffic through its shared datacenter IPs, 
 
 ---
 
-## 🛠️ Mandatory Requirements for Cloud Deployment
+## 🛠️ Environment Variables
 
-To successfully run YouDown on Render, configure the following environment variables in the Render Dashboard:
+Nothing beyond `render.yaml` is required. Optional overrides:
 
-| Variable | Description | Required? |
+| Variable | Description | Default |
 |---|---|---|
-| `YOUTUBE_PROXY` | HTTP/SOCKS5 Residential Proxy (e.g. `http://user:pass@res-proxy.com:8080`) | **Required** on cloud datacenters |
-| `YOUTUBE_COOKIES` | Netscape format cookies exported from a logged-in residential browser session | Strongly recommended |
-| `YOUTUBE_PLAYER_CLIENT` | Override player client if needed (e.g. `android` or `mweb`) | Optional |
-| `PORT` | Set to `3000` | Handled automatically |
+| `WARP_ENABLED` | Route YouTube traffic through Cloudflare WARP | `true` in the Docker image |
+| `WARP_IP_FAMILY` | `ipv4` tunnels IPv4 only; `dual` also allows IPv6, whose WARP ranges YouTube bot-walls | `ipv4` |
+| `YOUTUBE_PROXY` | Your own HTTP/SOCKS5 proxy; takes precedence over WARP | unset |
+| `YOUTUBE_PLAYER_CLIENT` | Override the yt-dlp player client (e.g. `mweb`) | `web_embedded`, then `mweb,tv` |
+| `PORT` | HTTP port | `10000` |
 
 > **Recommended Plan**: At least a **Starter** or **Standard** plan (2 GB+ RAM) with a persistent disk if you want file caching.
 
@@ -97,7 +95,9 @@ To use the URL trick on your own domain:
 
 The Docker image ships `wgcf` + `wireproxy` and starts a userspace Cloudflare WARP tunnel on boot (`WARP_ENABLED=true`). yt-dlp is routed through it via a local SOCKS5 proxy, so YouTube sees a Cloudflare IP instead of Render's datacenter IP. The default yt-dlp client is `web_embedded,mweb,tv`.
 
-- **Check status:** `GET /api/health` → `warp.ready`, `warp.warp` (`on`), `warp.egressIp`, `warp.colo`
+- **IPv4 only:** the tunnel drops IPv6 (`WARP_IP_FAMILY=ipv4`). YouTube flags WARP's IPv6 ranges; with dual-stack, 19/20 videos hit the bot wall (2026-11-16)
+- **Check status:** `GET /api/health` → `warp.ready`, `warp.warp` (`on`), `warp.ipFamily`, `warp.egressIp` (should be IPv4), `warp.colo`
+- **If YouTube still blocks:** the user sees "YouTube is temporarily blocking our server" with a **Try again** button (API: `503`, `code: "YT_BLOCKED"`)
 - **Self-healing:** on a bot-wall / 403 / 429 error the service registers a new WARP identity and retries once (cooldown: `WARP_ROTATE_COOLDOWN_SECONDS`, default 300)
 - **Fallback:** if the tunnel can't come up, the app still runs and connects directly
 - An explicit `YOUTUBE_PROXY` always takes precedence over WARP

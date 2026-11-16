@@ -87,6 +87,7 @@ Running a YouTube downloader on cloud platforms like **Render**, **Heroku**, or 
   - `HTTP Error 429: Too Many Requests`
   - `Sign in to confirm you’re not a bot`
   - Mandatory **PO Tokens (Proof of Origin)** and bot challenge scripts that cannot be solved headless on datacenter IPs without a residential proxy.
+- **How YouDown handles it:** YouTube traffic goes through a free Cloudflare **WARP** tunnel running **IPv4-only** (WARP's IPv6 ranges are bot-walled too). See [`docs/WARP_DEPLOYMENT_PLAN.md`](./docs/WARP_DEPLOYMENT_PLAN.md).
 
 ### 2. ⏳ Render Free Tier Sleep & Cold Starts
 - Render's free tier spins down web services after 15 minutes of inactivity.
@@ -107,14 +108,11 @@ Running a YouTube downloader on cloud platforms like **Render**, **Heroku**, or 
 
 ## 🛠️ How to Make Cloud Deployment Work (Workarounds)
 
-If you must deploy to Render or another cloud provider, you **must** configure:
+The Docker image already does what's needed on Render's free tier, with no proxy or cookies:
 
-1. **Residential Proxy**:
-   Configure a residential proxy in `backend/.env` via `YOUTUBE_PROXY=http://user:pass@proxy.residential.com:port`. This routes download traffic through a home IP so YouTube will not flag it as a datacenter bot.
-2. **Exported YouTube Cookies**:
-   Supply valid cookies exported from a logged-in residential browser session via the `YOUTUBE_COOKIES` or `COOKIES_FILE` environment variable.
-3. **Upgrade Render Instance**:
-   Use at least a **Starter** or **Standard** instance (2 GB+ RAM) to avoid OOM crashes during FFmpeg stream multiplexing.
+1. **Cloudflare WARP egress (IPv4)**: built in and on by default (`WARP_ENABLED=true`, `WARP_IP_FAMILY=ipv4`). Check `GET /api/health`: `warp.egressIp` should be an IPv4 address.
+2. **In-browser muxing**: video and audio are relayed in small chunks and muxed in the browser, so the server never runs a big ffmpeg merge.
+3. **Optional:** `YOUTUBE_PROXY` (your own proxy) still overrides WARP. The project's decision is to stay free, with no paid proxies or cookies.
 
 > **💡 Recommended Setup**: Run YouDown **locally** on your own computer, home server, or Raspberry Pi where your residential IP is accepted by YouTube without proxies or cookies.
 
@@ -122,4 +120,4 @@ If you must deploy to Render or another cloud provider, you **must** configure:
 
 ## ☁️ Deploying on Render
 
-See [`RENDER_DEPLOYMENT.md`](./RENDER_DEPLOYMENT.md) for full instructions and required proxy configurations.
+See [`RENDER_DEPLOYMENT.md`](./RENDER_DEPLOYMENT.md) for full instructions and environment variables.
