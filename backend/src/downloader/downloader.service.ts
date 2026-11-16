@@ -2,7 +2,9 @@ import {
   Injectable,
   InternalServerErrorException,
   BadRequestException,
+  HttpException,
   Logger,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ChildProcess, spawn } from 'child_process';
@@ -70,6 +72,9 @@ const BLOCKED_PATTERNS = [
   /Sign in to confirm/i,
   /This content isn.?t available, try again later/i,
 ];
+
+export const BLOCKED_MESSAGE =
+  'YouTube is temporarily blocking our server. Please try again in a minute.';
 
 export function isBlockedError(stderr: string): boolean {
   return BLOCKED_PATTERNS.some((pattern) => pattern.test(stderr));
@@ -228,9 +233,7 @@ export class DownloaderService {
 
     if (result.code !== 0) {
       this.logger.error(`yt-dlp exited with code ${result.code}: ${result.stderr}`);
-      throw new BadRequestException(
-        `Could not retrieve video information: ${this.firstErrorLine(result, target)}`,
-      );
+      throw this.failure('Could not retrieve video information', result, target);
     }
 
     let info: any;
@@ -361,7 +364,7 @@ export class DownloaderService {
     if (result.code !== 0) {
       this.logger.error(`Download process exited with code ${result.code}: ${result.stderr}`);
       this.cleanupPartialFiles(fileKey);
-      throw new BadRequestException(`Download failed: ${this.firstErrorLine(result, target)}`);
+      throw this.failure('Download failed', result, target);
     }
 
     if (options.section) {
@@ -594,6 +597,23 @@ export class DownloaderService {
       });
       child.on('close', (code) => resolve({ code, stdout, stderr }));
     });
+  }
+
+  /**
+   * The error for a failed yt-dlp run. YouTube's bot wall becomes a 503 with
+   * code YT_BLOCKED and a plain message: yt-dlp's own text tells the user to
+   * pass cookies, which they can't, and the frontend offers a retry instead.
+   */
+  private failure(prefix: string, result: YtDlpResult, target: MediaTarget): HttpException {
+    const errorLine = this.firstErrorLine(result, target);
+    if (target.platform === 'youtube' && isBlockedError(errorLine)) {
+      return new ServiceUnavailableException({
+        statusCode: 503,
+        code: 'YT_BLOCKED',
+        message: BLOCKED_MESSAGE,
+      });
+    }
+    return new BadRequestException(`${prefix}: ${errorLine}`);
   }
 
   private firstErrorLine(result: YtDlpResult, target?: MediaTarget): string {

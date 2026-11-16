@@ -706,6 +706,32 @@
   gap: 0.4rem;
 }
 
+.error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.6rem;
+}
+
+.retry-button {
+  margin-top: 0.5rem;
+  background-color: #2563eb;
+  border: none;
+  color: #ffffff;
+  padding: 0.6rem 1.2rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.retry-button:hover {
+  background-color: #1d4ed8;
+}
+
 .secondary-button:hover {
   background-color: #f1f5f9;
 }

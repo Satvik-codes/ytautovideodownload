@@ -22,5 +22,8 @@ services:
         value: 2
       - key: WARP_ENABLED
         value: true
+      # ipv4: YouTube flags WARP's IPv6 egress as bots; set dual to revert
+      - key: WARP_IP_FAMILY
+        value: ipv4
       - key: STREAM_TOKEN_SECRET
         generateValue: true

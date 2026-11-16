@@ -5,11 +5,13 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import { parseWarpIpFamily, toIpv4OnlyProfile, WarpIpFamily } from './utils/warp-profile.js';
 
 export interface WarpStatus {
   enabled: boolean;
   ready: boolean;
   proxy: string | null;
+  ipFamily: WarpIpFamily;
   egressIp: string | null;
   warp: string | null;
   colo: string | null;
@@ -29,6 +31,8 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
   private readonly port: number;
   private readonly workDir: string;
   private readonly rotateCooldownMs: number;
+  // IPv4 by default: YouTube flags WARP's IPv6 egress ranges as bots
+  private readonly ipFamily: WarpIpFamily;
   private wireproxy: ChildProcess | null = null;
   private ready = false;
   private rotations = 0;
@@ -44,6 +48,7 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
     this.rotateCooldownMs =
       parseInt(this.configService.get<string>('WARP_ROTATE_COOLDOWN_SECONDS') || '300', 10) *
       1000;
+    this.ipFamily = parseWarpIpFamily(this.configService.get<string>('WARP_IP_FAMILY'));
   }
 
   onModuleInit() {
@@ -122,6 +127,7 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
       enabled: this.enabled,
       ready: this.ready,
       proxy: this.getProxyUrl(),
+      ipFamily: this.ipFamily,
       egressIp: null,
       warp: null,
       colo: null,
@@ -152,10 +158,17 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
       await this.run('wgcf', ['generate']);
     }
 
+    // The wgcf profile stays as generated; wireproxy reads a rewritten copy
+    let tunnelProfile = profileFile;
+    if (this.ipFamily === 'ipv4') {
+      tunnelProfile = path.join(this.workDir, 'wgcf-profile-ipv4.conf');
+      fs.writeFileSync(tunnelProfile, toIpv4OnlyProfile(fs.readFileSync(profileFile, 'utf-8')), 'utf-8');
+    }
+
     const configFile = path.join(this.workDir, 'wireproxy.conf');
     fs.writeFileSync(
       configFile,
-      `WGConfig = ${profileFile}\n\n[Socks5]\nBindAddress = 127.0.0.1:${this.port}\n`,
+      `WGConfig = ${tunnelProfile}\n\n[Socks5]\nBindAddress = 127.0.0.1:${this.port}\n`,
       'utf-8',
     );
 
@@ -186,7 +199,7 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
     }
     this.ready = true;
     this.lastError = null;
-    this.logger.log(`WARP ready on socks5://127.0.0.1:${this.port} (egress ${trace.ip}, ${trace.colo})`);
+    this.logger.log(`WARP ready on socks5://127.0.0.1:${this.port} (${this.ipFamily}, egress ${trace.ip}, ${trace.colo})`);
   }
 
   private stopProxy() {

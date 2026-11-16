@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Download, CheckCircle2, Clock, Loader2, RefreshCw, AlertCircle, XCircle, Ban } from 'lucide-react';
+import { Download, CheckCircle2, Clock, Loader2, RefreshCw, RotateCw, AlertCircle, XCircle, Ban } from 'lucide-react';
 import { DEFAULT_SELECTION } from '../types/video';
 import type { VideoInfo, DownloadStatus, DownloadSelection } from '../types/video';
 import { DownloadOptions } from './DownloadOptions';
@@ -12,6 +12,8 @@ interface VideoPreviewCardProps {
   progress: number;
   onDownload: (selection: DownloadSelection) => void;
   onCancel: () => void;
+  /** Set when loading failed for a temporary reason worth retrying */
+  onRetry?: () => void;
   onReset: () => void;
 }
 
@@ -22,6 +24,7 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
   progress,
   onDownload,
   onCancel,
+  onRetry,
   onReset,
 }) => {
   const [selection, setSelection] = useState<DownloadSelection>(DEFAULT_SELECTION);
@@ -37,10 +40,18 @@ export const VideoPreviewCard: React.FC<VideoPreviewCardProps> = ({
         <p className="error-message">
           {errorMessage || 'The video could not be loaded. Please ensure the link is valid and public.'}
         </p>
-        <button onClick={onReset} className="secondary-button">
-          <RefreshCw size={16} />
-          <span>Try Another Video</span>
-        </button>
+        <div className="error-actions">
+          {onRetry && (
+            <button onClick={onRetry} className="retry-button">
+              <RotateCw size={16} />
+              <span>Try again</span>
+            </button>
+          )}
+          <button onClick={onReset} className="secondary-button">
+            <RefreshCw size={16} />
+            <span>Try Another Video</span>
+          </button>
+        </div>
       </div>
     );
   }

@@ -32,6 +32,9 @@ export function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const hasAutoLoaded = useRef(false);
+  // Last requested video, so a temporary YouTube block can be retried in place
+  const lastMedia = useRef<MediaRef | null>(null);
+  const [retryable, setRetryable] = useState(false);
   // Aborting this cancels the running download, in the browser or on the server
   const downloadAbort = useRef<AbortController | null>(null);
 
@@ -141,13 +144,17 @@ export function App() {
   // Loads the video info only; the download starts when the user presses Download
   const handleLoad = async (media: MediaRef) => {
     cancelDownload();
+    lastMedia.current = media;
     setStatus('fetching_info');
     setErrorMessage(null);
+    setRetryable(false);
 
     try {
       const response = await fetch(getApiUrl(`/api/video/info?${media.apiQuery}`));
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        // The server marks YouTube's bot wall; it usually clears after a retry
+        setRetryable(errorData.code === 'YT_BLOCKED');
         throw new Error(errorData.message || 'Unable to retrieve video information.');
       }
 
@@ -216,6 +223,9 @@ export function App() {
             progress={progress}
             onDownload={(selection) => video && startDownload(video, selection)}
             onCancel={cancelDownload}
+            onRetry={
+              retryable ? () => lastMedia.current && handleLoad(lastMedia.current) : undefined
+            }
             onReset={handleReset}
           />
         )}
