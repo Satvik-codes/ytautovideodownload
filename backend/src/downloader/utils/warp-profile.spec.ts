@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseWarpIpFamily, toIpv4OnlyProfile } from './warp-profile.js';
+import { decodeProfileEnv, parseWarpIpFamily, toIpv4OnlyProfile } from './warp-profile.js';
 
 // Shape of a real `wgcf generate` profile (keys replaced)
 const PROFILE = `[Interface]
@@ -40,5 +40,19 @@ describe('parseWarpIpFamily', () => {
     expect(parseWarpIpFamily(undefined)).toBe('ipv4');
     expect(parseWarpIpFamily('bogus')).toBe('ipv4');
     expect(parseWarpIpFamily(' DUAL ')).toBe('dual');
+  });
+});
+
+describe('decodeProfileEnv', () => {
+  const b64 = Buffer.from(PROFILE, 'utf-8').toString('base64');
+
+  it('decodes a base64 profile, tolerating pasted line breaks', () => {
+    expect(decodeProfileEnv(b64)).toBe(PROFILE);
+    expect(decodeProfileEnv(`${b64.slice(0, 40)}\n  ${b64.slice(40)}\n`)).toBe(PROFILE);
+  });
+
+  it('rejects values that are not WireGuard profiles', () => {
+    expect(() => decodeProfileEnv(Buffer.from('hello').toString('base64'))).toThrow(/PrivateKey/);
+    expect(() => decodeProfileEnv('')).toThrow(/not a WireGuard profile/);
   });
 });

@@ -75,6 +75,11 @@ const BLOCKED_PATTERNS = [
 
 export const BLOCKED_MESSAGE =
   'YouTube is temporarily blocking our server. Please try again in a minute.';
+export const TUNNEL_DOWN_MESSAGE =
+  'Our download tunnel is restarting. Please try again in a minute.';
+
+// How long a YouTube request waits for a down WARP tunnel before giving up
+const WARP_WAIT_MS = 10_000;
 
 export function isBlockedError(stderr: string): boolean {
   return BLOCKED_PATTERNS.some((pattern) => pattern.test(stderr));
@@ -130,12 +135,38 @@ export class DownloaderService {
 
   /** Proxy for all YouTube traffic: an explicit proxy wins, else the WARP tunnel when up. */
   getProxyUrl(): string | null {
+    return this.explicitProxy() || this.warpService.getProxyUrl();
+  }
+
+  private explicitProxy(): string | null {
     const proxy =
       this.configService.get<string>('YOUTUBE_PROXY') ||
       this.configService.get<string>('HTTP_PROXY') ||
-      this.configService.get<string>('HTTPS_PROXY') ||
-      this.warpService.getProxyUrl();
+      this.configService.get<string>('HTTPS_PROXY');
     return proxy && proxy.trim() ? proxy.trim() : null;
+  }
+
+  /** Where an attempt's traffic actually goes, for logs ("proxy: true" used to hide a dead tunnel). */
+  private route(attempt: Attempt): string {
+    if (!attempt.useProxy) return 'direct';
+    if (this.explicitProxy()) return 'via proxy';
+    return this.warpService.isReady() ? 'via WARP' : 'direct (WARP down)';
+  }
+
+  /**
+   * YouTube walls datacenter IPs, so with WARP enabled a YouTube request must
+   * not go direct. Waits briefly for a reconnect, then fails with a
+   * retryable 503 instead of burning the host IP's reputation.
+   */
+  private async requireTunnel(target: MediaTarget): Promise<void> {
+    if (target.platform !== 'youtube' || !this.warpService.isEnabled() || this.explicitProxy()) return;
+    if (await this.warpService.ensureReady(WARP_WAIT_MS)) return;
+    this.logger.warn('WARP tunnel is down; refusing to reach YouTube directly.');
+    throw new ServiceUnavailableException({
+      statusCode: 503,
+      code: 'YT_BLOCKED',
+      message: TUNNEL_DOWN_MESSAGE,
+    });
   }
 
   verifyStreamToken(token: string): StreamTokenPayload | null {
@@ -444,8 +475,8 @@ export class DownloaderService {
 
   /**
    * Runs yt-dlp with each attempt in the platform's chain until one succeeds.
-   * If the egress IP is blocked and WARP is enabled, rotates the WARP identity
-   * and retries the same attempt once. Args are rebuilt per attempt so the
+   * If the egress IP is blocked and WARP is enabled, reconnects the WARP
+   * tunnel and retries the same attempt once. Args are rebuilt per attempt so the
    * current proxy state applies.
    */
   private async runYtDlpWithRotation(
@@ -458,24 +489,25 @@ export class DownloaderService {
     let rotated = false;
 
     for (const attempt of this.attemptChain(target)) {
+      if (attempt.useProxy) await this.requireTunnel(target);
       result = await this.runYtDlp(buildArgs(attempt), onChild);
       if (result.code === 0 || shouldStop?.()) {
         if (result.code === 0 && target.platform === 'twitter') {
-          this.logger.log(`X extraction succeeded via ${attempt.extractorArgs} (proxy: ${attempt.useProxy})`);
+          this.logger.log(`X extraction succeeded with ${attempt.extractorArgs} (${this.route(attempt)})`);
         }
         return result;
       }
 
       if (attempt.useProxy && isBlockedError(result.stderr) && !rotated && this.warpService.isEnabled()) {
         rotated = true;
-        this.logger.warn('Egress IP blocked; rotating WARP and retrying.');
+        this.logger.warn(`Egress IP blocked (${this.route(attempt)}); reconnecting WARP and retrying.`);
         if (await this.warpService.rotate()) {
           result = await this.runYtDlp(buildArgs(attempt), onChild);
           if (result.code === 0 || shouldStop?.()) return result;
         }
       }
       this.logger.warn(
-        `yt-dlp failed with ${attempt.extractorArgs} (proxy: ${attempt.useProxy}): ${this.firstErrorLine(result)}`,
+        `yt-dlp failed with ${attempt.extractorArgs} (${this.route(attempt)}): ${this.firstErrorLine(result)}`,
       );
       // Content errors (no video, deleted) won't change with another attempt
       if (target.platform === 'twitter' && this.matchTwitterError(result)?.final) break;

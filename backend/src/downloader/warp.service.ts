@@ -5,7 +5,16 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { parseWarpIpFamily, toIpv4OnlyProfile, WarpIpFamily } from './utils/warp-profile.js';
+import {
+  decodeProfileEnv,
+  parseWarpIpFamily,
+  toIpv4OnlyProfile,
+  WarpIpFamily,
+} from './utils/warp-profile.js';
+
+// Reconnect backoff while the tunnel is down: 30 s doubling to 5 min, forever
+const RECONNECT_INITIAL_MS = 30_000;
+const RECONNECT_MAX_MS = 5 * 60_000;
 
 export interface WarpStatus {
   enabled: boolean;
@@ -16,6 +25,8 @@ export interface WarpStatus {
   warp: string | null;
   colo: string | null;
   rotations: number;
+  /** env: fixed identity from WARP_PROFILE_B64; registered: wgcf account made at runtime */
+  identity: 'env' | 'registered';
   lastError: string | null;
 }
 
@@ -33,6 +44,13 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
   private readonly rotateCooldownMs: number;
   // IPv4 by default: YouTube flags WARP's IPv6 egress ranges as bots
   private readonly ipFamily: WarpIpFamily;
+  // A fixed identity survives restarts; without it every cold start (Render
+  // wipes /tmp) registers a new account, and Cloudflare rate-limits those
+  private readonly envProfile: string | null;
+  private starting: Promise<void> | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectDelayMs = RECONNECT_INITIAL_MS;
+  private destroyed = false;
   private wireproxy: ChildProcess | null = null;
   private ready = false;
   private rotations = 0;
@@ -49,31 +67,72 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
       parseInt(this.configService.get<string>('WARP_ROTATE_COOLDOWN_SECONDS') || '300', 10) *
       1000;
     this.ipFamily = parseWarpIpFamily(this.configService.get<string>('WARP_IP_FAMILY'));
+    this.envProfile = this.configService.get<string>('WARP_PROFILE_B64')?.trim() || null;
   }
 
   onModuleInit() {
     if (!this.enabled) return;
-    // Start in the background so the HTTP server binds immediately; until the
-    // tunnel is up, yt-dlp connects directly
-    void this.startWithRetries(3, 30000);
-  }
-
-  private async startWithRetries(attempts: number, delayMs: number) {
-    for (let i = 1; i <= attempts; i++) {
-      try {
-        await this.start();
-        return;
-      } catch (err) {
-        // Keep the app running without WARP rather than failing the deploy
-        this.lastError = err instanceof Error ? err.message : String(err);
-        this.logger.error(`WARP start attempt ${i}/${attempts} failed: ${this.lastError}`);
-        if (i < attempts) await new Promise((r) => setTimeout(r, delayMs));
-      }
+    if (!this.envProfile) {
+      this.logger.warn(
+        'WARP_PROFILE_B64 is not set: a WARP account is registered at runtime, again after every restart. ' +
+          'Hosts with ephemeral disks and shared IPs (Render) soon hit Cloudflare\'s 429 on registration.',
+      );
     }
+    // Start in the background so the HTTP server binds immediately
+    void this.connect();
   }
 
   onModuleDestroy() {
+    this.destroyed = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.stopProxy();
+  }
+
+  /** Starts the tunnel (one attempt at a time); on failure schedules a retry with backoff. */
+  private async connect(): Promise<void> {
+    if (!this.starting) {
+      this.starting = this.start()
+        .then(() => {
+          this.reconnectDelayMs = RECONNECT_INITIAL_MS;
+        })
+        .catch((err) => {
+          this.lastError = err instanceof Error ? err.message : String(err);
+          this.logger.error(`WARP start failed: ${this.lastError}`);
+          this.scheduleReconnect();
+        })
+        .finally(() => {
+          this.starting = null;
+        });
+    }
+    return this.starting;
+  }
+
+  private scheduleReconnect() {
+    if (this.destroyed || this.reconnectTimer) return;
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(delay * 2, RECONNECT_MAX_MS);
+    this.logger.warn(`WARP retry in ${Math.round(delay / 1000)}s`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.ready) void this.connect();
+    }, delay);
+    this.reconnectTimer.unref();
+  }
+
+  /**
+   * Waits up to timeoutMs for the tunnel, starting it if it's down and no
+   * attempt is running. Lets a request wait out a reconnect instead of
+   * going direct from the host's (bot-walled) IP.
+   */
+  async ensureReady(timeoutMs: number): Promise<boolean> {
+    if (!this.enabled) return false;
+    if (this.ready) return true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    await Promise.race([this.connect(), new Promise((r) => setTimeout(r, timeoutMs).unref())]);
+    return this.ready;
   }
 
   getProxyUrl(): string | null {
@@ -84,10 +143,15 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
     return this.enabled;
   }
 
+  isReady(): boolean {
+    return this.ready;
+  }
+
   /**
-   * Registers a fresh WARP identity and restarts the proxy, usually giving a
-   * new egress IP. Concurrent callers share one rotation; calls inside the
-   * cooldown window are ignored.
+   * Reconnects the tunnel with the same identity; a new WireGuard session can
+   * land on a different (shared) IPv4 egress. The identity is never deleted:
+   * registering replacements is what got Cloudflare to answer 429. Concurrent
+   * callers share one rotation; calls inside the cooldown window are ignored.
    */
   async rotate(): Promise<boolean> {
     if (!this.enabled) return false;
@@ -102,16 +166,10 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
 
     this.lastRotationAt = Date.now();
     this.rotating = (async () => {
-      this.logger.warn('Rotating WARP identity...');
+      this.logger.warn('Reconnecting WARP...');
       this.stopProxy();
-      fs.rmSync(this.workDir, { recursive: true, force: true });
-      try {
-        await this.start();
-        this.rotations++;
-      } catch (err) {
-        this.lastError = err instanceof Error ? err.message : String(err);
-        this.logger.error(`WARP rotation failed: ${this.lastError}`);
-      }
+      await this.connect();
+      if (this.ready) this.rotations++;
     })();
 
     try {
@@ -132,6 +190,7 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
       warp: null,
       colo: null,
       rotations: this.rotations,
+      identity: this.envProfile ? 'env' : 'registered',
       lastError: this.lastError,
     };
     if (!this.ready) return status;
@@ -146,16 +205,20 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async start(): Promise<void> {
-    this.ready = false;
+    this.stopProxy();
     fs.mkdirSync(this.workDir, { recursive: true });
 
     const accountFile = path.join(this.workDir, 'wgcf-account.toml');
     const profileFile = path.join(this.workDir, 'wgcf-profile.conf');
-    if (!fs.existsSync(accountFile)) {
-      await this.run('wgcf', ['register', '--accept-tos']);
-    }
-    if (!fs.existsSync(profileFile)) {
-      await this.run('wgcf', ['generate']);
+    if (this.envProfile) {
+      fs.writeFileSync(profileFile, decodeProfileEnv(this.envProfile), { encoding: 'utf-8', mode: 0o600 });
+    } else {
+      if (!fs.existsSync(accountFile)) {
+        await this.run('wgcf', ['register', '--accept-tos']);
+      }
+      if (!fs.existsSync(profileFile)) {
+        await this.run('wgcf', ['generate']);
+      }
     }
 
     // The wgcf profile stays as generated; wireproxy reads a rewritten copy
@@ -184,18 +247,24 @@ export class WarpService implements OnModuleInit, OnModuleDestroy {
         this.ready = false;
         this.wireproxy = null;
         this.logger.error(`wireproxy exited with code ${code}`);
+        this.scheduleReconnect();
       }
     });
     this.wireproxy = child;
 
-    await this.waitForPort(15000);
-
     // wireproxy opens its port before the WireGuard handshake, so only mark the
     // tunnel ready once traffic actually flows through Cloudflare
-    const trace = await this.fetchTrace();
-    if (!trace || trace.warp !== 'on') {
+    let trace: Record<string, string> | null;
+    try {
+      await this.waitForPort(15000);
+      trace = await this.fetchTrace();
+      if (!trace || trace.warp !== 'on') {
+        throw new Error(`WARP tunnel not passing traffic (trace warp=${trace?.warp ?? 'unreachable'})`);
+      }
+    } catch (err) {
+      // Don't leave a half-started wireproxy holding the port for the next attempt
       this.stopProxy();
-      throw new Error(`WARP tunnel not passing traffic (trace warp=${trace?.warp ?? 'unreachable'})`);
+      throw err;
     }
     this.ready = true;
     this.lastError = null;

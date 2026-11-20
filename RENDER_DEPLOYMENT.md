@@ -30,6 +30,7 @@ Nothing beyond `render.yaml` is required. Optional overrides:
 |---|---|---|
 | `WARP_ENABLED` | Route YouTube traffic through Cloudflare WARP | `true` in the Docker image |
 | `WARP_IP_FAMILY` | `ipv4` tunnels IPv4 only; `dual` also allows IPv6, whose WARP ranges YouTube bot-walls | `ipv4` |
+| `WARP_PROFILE_B64` | **Set this.** Fixed WARP identity: base64 of a `wgcf-profile.conf`. Without it every cold start registers a new WARP account, and Cloudflare soon answers `429`, leaving the tunnel down. Secret: dashboard only, never commit | unset |
 | `YOUTUBE_PROXY` | Your own HTTP/SOCKS5 proxy; takes precedence over WARP | unset |
 | `YOUTUBE_PLAYER_CLIENT` | Override the yt-dlp player client (e.g. `mweb`) | `web_embedded`, then `mweb,tv` |
 | `PORT` | HTTP port | `10000` |
@@ -95,11 +96,17 @@ To use the URL trick on your own domain:
 
 The Docker image ships `wgcf` + `wireproxy` and starts a userspace Cloudflare WARP tunnel on boot (`WARP_ENABLED=true`). yt-dlp is routed through it via a local SOCKS5 proxy, so YouTube sees a Cloudflare IP instead of Render's datacenter IP. The default yt-dlp client is `web_embedded,mweb,tv`.
 
+- **Fixed identity (`WARP_PROFILE_B64`):** generate once and paste into the dashboard as a secret:
+```bash
+wgcf register --accept-tos && wgcf generate        # on any machine where registration works
+base64 -w0 wgcf-profile.conf                        # PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes("wgcf-profile.conf"))
+```
+  `/api/health` then shows `warp.identity: "env"`, and restarts never call Cloudflare's registration API
 - **IPv4 only:** the tunnel drops IPv6 (`WARP_IP_FAMILY=ipv4`). YouTube flags WARP's IPv6 ranges; with dual-stack, 19/20 videos hit the bot wall (2026-11-16)
 - **Check status:** `GET /api/health` → `warp.ready`, `warp.warp` (`on`), `warp.ipFamily`, `warp.egressIp` (should be IPv4), `warp.colo`
 - **If YouTube still blocks:** the user sees "YouTube is temporarily blocking our server" with a **Try again** button (API: `503`, `code: "YT_BLOCKED"`)
-- **Self-healing:** on a bot-wall / 403 / 429 error the service registers a new WARP identity and retries once (cooldown: `WARP_ROTATE_COOLDOWN_SECONDS`, default 300)
-- **Fallback:** if the tunnel can't come up, the app still runs and connects directly
+- **Self-healing:** on a bot-wall / 403 / 429 error the service reconnects the tunnel with the same identity and retries once (cooldown: `WARP_ROTATE_COOLDOWN_SECONDS`, default 300). While down, it keeps reconnecting with backoff (30 s up to 5 min)
+- **No direct YouTube traffic:** if the tunnel is down, YouTube requests get a retryable `503 YT_BLOCKED` instead of going out from Render's IP (which YouTube always blocks)
 - An explicit `YOUTUBE_PROXY` always takes precedence over WARP
 
 ### In-browser downloads (no server ffmpeg, no long requests)

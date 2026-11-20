@@ -25,6 +25,24 @@ export function toIpv4OnlyProfile(profile: string): string {
     .join('\n');
 }
 
+/**
+ * Decodes WARP_PROFILE_B64 (base64 of a `wgcf generate` profile). A fixed
+ * identity from the environment survives restarts, so the service never has
+ * to register a WARP account itself; Cloudflare rate-limits registrations
+ * (429) from shared egress IPs like Render's. Throws with the reason when the
+ * value isn't a usable WireGuard profile.
+ */
+export function decodeProfileEnv(base64: string): string {
+  const profile = Buffer.from(base64.replace(/\s+/g, ''), 'base64').toString('utf-8');
+  const missing = ['[Interface]', 'PrivateKey', '[Peer]', 'Endpoint'].filter(
+    (part) => !profile.includes(part),
+  );
+  if (missing.length) {
+    throw new Error(`WARP_PROFILE_B64 is not a WireGuard profile (missing ${missing.join(', ')})`);
+  }
+  return profile;
+}
+
 export function parseWarpIpFamily(value: string | undefined): WarpIpFamily {
   return (value || 'ipv4').trim().toLowerCase() === 'dual' ? 'dual' : 'ipv4';
 }

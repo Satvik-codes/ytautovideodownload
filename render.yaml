@@ -25,5 +25,9 @@ services:
       # ipv4: YouTube flags WARP's IPv6 egress as bots; set dual to revert
       - key: WARP_IP_FAMILY
         value: ipv4
+      # Fixed WARP identity (base64 wgcf-profile.conf), set in the dashboard only:
+      # without it every cold start registers a new account and Cloudflare answers 429
+      - key: WARP_PROFILE_B64
+        sync: false
       - key: STREAM_TOKEN_SECRET
         generateValue: true

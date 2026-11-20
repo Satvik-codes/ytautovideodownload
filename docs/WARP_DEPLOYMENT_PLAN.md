@@ -130,3 +130,31 @@ YouTube blocks Render's datacenter IPs ("Sign in to confirm you're not a bot"). 
 - A full-length server MP3 took 106 s.
 - That is close to Render's 100 s request limit. Next candidates: find which client in the chain actually succeeds and try it first; add the PO-token provider (Step 2) if YouTube starts walling IPv4 too.
 
+---
+
+## wgcf 429: persist the WARP identity (2026-11-20)
+
+**Symptom:** every YouTube request hit the bot wall again (HTTP 429 plus "Sign in to confirm you're not a bot"), four days after the IPv4 fix.
+
+**What the live site reported:**
+- `/api/health`: `ready: false, proxy: null`
+- `lastError`: `wgcf register --accept-tos ... 429 Too Many Requests` (the `*openapi.GenericOpenAPIError` in the logs)
+
+**Cause:** the WARP tunnel was down, so yt-dlp went **direct from Render's datacenter IP**. The `(proxy: true)` in the logs hid this: it printed what an attempt wanted, not what it got.
+- The WARP account lived in `/tmp/warp`, which Render free wipes on every sleep/wake and every deploy. So **every cold start registered a new WARP account**.
+- `rotate()` also deleted the account and registered another.
+- All those registrations come from Render's shared egress IP, so Cloudflare rate-limited registration (`429`) and the tunnel could never start.
+- After 3 boot attempts it never retried.
+
+**Fix:**
+- **`WARP_PROFILE_B64`:** a fixed identity (base64 `wgcf-profile.conf`), set in the Render dashboard. It is never committed, since the repo is public. With it set, the service never calls `wgcf register`, and `/api/health` shows `warp.identity: "env"`. Generate it once:
+```bash
+wgcf register --accept-tos && wgcf generate        # on any machine where registration works
+base64 -w0 wgcf-profile.conf                        # PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes("wgcf-profile.conf"))
+```
+- **Reconnect, not rotate:** `rotate()` now restarts wireproxy with the **same** identity. It never deletes or re-registers.
+- **Self-healing:** while down, the tunnel reconnects with backoff (30 s doubling to 5 min, forever), and also after wireproxy exits unexpectedly.
+- **Fail fast:** with WARP enabled and down (and no `YOUTUBE_PROXY`), a YouTube request waits up to 10 s for a reconnect, then returns the retryable `503 YT_BLOCKED` ("Our download tunnel is restarting..."). It never goes direct. X/Twitter is unaffected.
+- **Honest logs:** each attempt logs `via WARP` / `via proxy` / `direct (WARP down)`.
+
+**Rule from now on: never let a deployment register WARP accounts on every start.** Give it a fixed identity.
